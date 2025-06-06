@@ -48,7 +48,7 @@ var (
 	authSuffix      = []byte(`"]}`)
 	cancelPrefix    = []byte(`{"reqId":"`)
 	cancelTemplate1 = []byte(`","header":{"X-BAPI-TIMESTAMP":"`)
-	cancelTemplate2 = []byte(`,"X-BAPI-RECV-WINDOW":"5000"},"op":"order.cancel","args":[{"symbol":"`)
+	cancelTemplate2 = []byte(`","X-BAPI-RECV-WINDOW":"5000"},"op":"order.cancel","args":[{"symbol":"`)
 	cancelTemplate3 = []byte(`","orderId":"`)
 	cancelTemplate4 = []byte(`","category":"linear"}]}`)
 	subPrefix       = []byte(`{"op":"subscribe","args":["tickers.`)
@@ -210,8 +210,8 @@ func (tb *TradingBot) Connect() error {
 	go tb.handleTradeMessages()
 	go tb.handlePublicMessages()
 
-	// Wait for authentication
-	time.Sleep(2 * time.Second)
+	// Reduce authentication wait time from 2 seconds to 1 second
+	time.Sleep(1 * time.Second)
 	atomic.StoreInt32(&tb.connReady, 1)
 	atomic.StoreInt32(&tb.publicReady, 1)
 
@@ -364,7 +364,16 @@ func (tb *TradingBot) SubscribeToSymbol(symbol string) error {
 		return err
 	}
 
-	log.Printf("✅ %s subscription sent", symbol)
+	// Remove the 500ms sleep - it's unnecessary!
+	// time.Sleep(500 * time.Millisecond)
+
+	// Check if we received price data (non-blocking)
+	if _, exists := tb.priceCache.Load(symbol); exists {
+		log.Printf("✅ %s price data confirmed", symbol)
+	} else {
+		log.Printf("🔔 %s subscription sent", symbol)
+	}
+
 	return nil
 }
 
@@ -538,7 +547,7 @@ func (tb *TradingBot) closePosition(chatId int64, symbol, orderId, oppositeSide,
 			// Cancel failed, place opposite order
 			tb.placeOppositeOrder(chatId, symbol, oppositeSide, qty, startTime)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(1 * time.Second): // Reduced from 2 seconds to 1 second
 		// Cancel timeout, place opposite order
 		tb.placeOppositeOrder(chatId, symbol, oppositeSide, qty, startTime)
 	}
@@ -564,7 +573,7 @@ func (tb *TradingBot) placeOppositeOrder(chatId int64, symbol, side, qty string,
 		} else {
 			sendMessage(chatId, fmt.Sprintf("❌ Close failed: %s", closeResp.RetMsg))
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(1 * time.Second): // Reduced from 2 seconds to 1 second
 		sendMessage(chatId, "❌ Close timeout")
 	}
 }
@@ -686,12 +695,14 @@ func handleUpdates(tb *TradingBot) {
 				} else {
 					sendMessage(chatId, fmt.Sprintf("🔥 Subscribed to %s price updates", symbol))
 
-					// REMOVED: time.Sleep(2 * time.Second)
-					// Check immediately for existing price data
+					// Remove the 2-second sleep that causes delay!
+					// time.Sleep(2 * time.Second)
+
+					// Check immediately if price data exists
 					if price, err := tb.GetPrice(symbol); err == nil {
-						sendMessage(chatId, fmt.Sprintf("✅ %s price available: %.8f", symbol, price))
+						sendMessage(chatId, fmt.Sprintf("✅ %s price confirmed: %.8f", symbol, price))
 					} else {
-						sendMessage(chatId, fmt.Sprintf("⚠️ %s subscription sent, price data will arrive shortly. Use /prices to check.", symbol))
+						sendMessage(chatId, fmt.Sprintf("🔔 %s subscription sent. Price data will be available shortly.", symbol))
 					}
 				}
 
