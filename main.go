@@ -48,7 +48,7 @@ var (
 	authSuffix      = []byte(`"]}`)
 	cancelPrefix    = []byte(`{"reqId":"`)
 	cancelTemplate1 = []byte(`","header":{"X-BAPI-TIMESTAMP":"`)
-	cancelTemplate2 = []byte(`","X-BAPI-RECV-WINDOW":"5000"},"op":"order.cancel","args":[{"symbol":"`)
+	cancelTemplate2 = []byte(`,"X-BAPI-RECV-WINDOW":"5000"},"op":"order.cancel","args":[{"symbol":"`)
 	cancelTemplate3 = []byte(`","orderId":"`)
 	cancelTemplate4 = []byte(`","category":"linear"}]}`)
 	subPrefix       = []byte(`{"op":"subscribe","args":["tickers.`)
@@ -364,16 +364,7 @@ func (tb *TradingBot) SubscribeToSymbol(symbol string) error {
 		return err
 	}
 
-	// Wait a moment for subscription confirmation
-	time.Sleep(500 * time.Millisecond)
-
-	// Check if we received price data
-	if _, exists := tb.priceCache.Load(symbol); exists {
-		log.Printf("✅ %s price data confirmed", symbol)
-	} else {
-		log.Printf("⚠️ %s subscription sent, waiting for price data...", symbol)
-	}
-
+	log.Printf("✅ %s subscription sent", symbol)
 	return nil
 }
 
@@ -695,14 +686,12 @@ func handleUpdates(tb *TradingBot) {
 				} else {
 					sendMessage(chatId, fmt.Sprintf("🔥 Subscribed to %s price updates", symbol))
 
-					// Wait and check for price data
-					time.Sleep(2 * time.Second)
-					if _, exists := tb.priceCache.Load(symbol); exists {
-						if price, err := tb.GetPrice(symbol); err == nil {
-							sendMessage(chatId, fmt.Sprintf("✅ %s price confirmed: %.8f", symbol, price))
-						}
+					// REMOVED: time.Sleep(2 * time.Second)
+					// Check immediately for existing price data
+					if price, err := tb.GetPrice(symbol); err == nil {
+						sendMessage(chatId, fmt.Sprintf("✅ %s price available: %.8f", symbol, price))
 					} else {
-						sendMessage(chatId, fmt.Sprintf("⚠️ %s subscription sent, but no price data received yet. Try /prices to see available data.", symbol))
+						sendMessage(chatId, fmt.Sprintf("⚠️ %s subscription sent, price data will arrive shortly. Use /prices to check.", symbol))
 					}
 				}
 
