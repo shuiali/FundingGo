@@ -23,7 +23,7 @@ import (
 const (
 	BYBIT_WS_TRADE_URL  = "wss://stream.bybit.com/v5/trade"
 	BYBIT_WS_PUBLIC_URL = "wss://stream.bybit.com/v5/public/linear"
-	AUTO_CLOSE_DELAY    = 5 * time.Second
+	AUTO_CLOSE_DELAY    = 5000 * time.Millisecond // Changed to exactly 5000ms
 	ORDER_TIMEOUT       = 3 * time.Second
 )
 
@@ -469,8 +469,8 @@ func (tb *TradingBot) ExecuteTrade(req TradeRequest) {
 	tb.responses.Store(reqId, respChan)
 	defer tb.responses.Delete(reqId)
 
-	// Send order
-	orderStartTime := time.Now()
+	// Send order and record exact time
+	orderOpenTime := time.Now()
 	if err := tb.tradeConn.WriteMessage(websocket.TextMessage, orderMsg); err != nil {
 		sendMessage(req.ChatId, fmt.Sprintf("❌ Failed to send order: %v", err))
 		return
@@ -479,7 +479,7 @@ func (tb *TradingBot) ExecuteTrade(req TradeRequest) {
 	// Wait for response
 	select {
 	case resp := <-respChan:
-		orderDuration := time.Since(orderStartTime)
+		orderDuration := time.Since(orderOpenTime)
 
 		if resp.RetCode != 0 {
 			sendMessage(req.ChatId, fmt.Sprintf("❌ Order failed: %s\n🔍 Debug: Qty=%s (%.6f), Value=%.2f USDT, Price=%.8f",
@@ -496,28 +496,38 @@ func (tb *TradingBot) ExecuteTrade(req TradeRequest) {
 			"🆔 Order: %s\n"+
 			"💰 Price: %.8f\n"+
 			"📈 Qty: %s\n\n"+
-			"⏳ Auto-closing in 5 seconds...",
+			"⏳ Auto-closing in exactly 5000ms...",
 			req.Symbol, req.Side, req.UsdtAmount, req.Leverage,
 			float64(orderDuration.Nanoseconds())/1000000.0,
 			orderId, price, qtyStr)
 
 		sendMessage(req.ChatId, msg)
 
-		// Wait 5 seconds then close
-		time.Sleep(AUTO_CLOSE_DELAY)
+		// Calculate exact wait time to ensure exactly 5000ms between open and close
+		elapsedSinceOpen := time.Since(orderOpenTime)
+		remainingWait := AUTO_CLOSE_DELAY - elapsedSinceOpen
 
-		// Close position
+		// Ensure we don't have negative wait time
+		if remainingWait > 0 {
+			time.Sleep(remainingWait)
+		}
+
+		// Close position exactly 5000ms after order was sent
 		closeStartTime := time.Now()
+		actualDelay := closeStartTime.Sub(orderOpenTime)
+
 		oppositeSide := "Sell"
 		if req.Side == "Sell" {
 			oppositeSide = "Buy"
 		}
 
 		// Try to cancel first, then place opposite order
-		tb.closePosition(req.ChatId, req.Symbol, orderId, oppositeSide, qtyStr, closeStartTime)
+		tb.closePosition(req.ChatId, req.Symbol, orderId, oppositeSide, qtyStr, closeStartTime, actualDelay)
 
 		totalDuration := time.Since(startTime)
-		sendMessage(req.ChatId, fmt.Sprintf("⏱️ Total: %.3f ms", float64(totalDuration.Nanoseconds())/1000000.0))
+		sendMessage(req.ChatId, fmt.Sprintf("⏱️ Total: %.3f ms\n🕐 Exact delay: %.0f ms",
+			float64(totalDuration.Nanoseconds())/1000000.0,
+			float64(actualDelay.Nanoseconds())/1000000.0))
 
 	case <-time.After(ORDER_TIMEOUT):
 		sendMessage(req.ChatId, "❌ Order timeout")
@@ -526,7 +536,7 @@ func (tb *TradingBot) ExecuteTrade(req TradeRequest) {
 }
 
 // Close position by canceling or placing opposite order
-func (tb *TradingBot) closePosition(chatId int64, symbol, orderId, oppositeSide, qty string, startTime time.Time) {
+func (tb *TradingBot) closePosition(chatId int64, symbol, orderId, oppositeSide, qty string, startTime time.Time, actualDelay time.Duration) {
 	// Try to cancel first
 	cancelReqId := generateReqId()
 	cancelMsg := buildCancelMessage(cancelReqId, symbol, orderId)
@@ -541,20 +551,21 @@ func (tb *TradingBot) closePosition(chatId int64, symbol, orderId, oppositeSide,
 	case cancelResp := <-cancelRespChan:
 		closeDuration := time.Since(startTime)
 		if cancelResp.RetCode == 0 {
-			sendMessage(chatId, fmt.Sprintf("✅ Cancelled successfully!\n⚡ Cancel: %.3f ms",
-				float64(closeDuration.Nanoseconds())/1000000.0))
+			sendMessage(chatId, fmt.Sprintf("✅ Cancelled successfully!\n⚡ Cancel: %.3f ms\n🕐 Opened for: %.0f ms",
+				float64(closeDuration.Nanoseconds())/1000000.0,
+				float64(actualDelay.Nanoseconds())/1000000.0))
 		} else {
 			// Cancel failed, place opposite order
-			tb.placeOppositeOrder(chatId, symbol, oppositeSide, qty, startTime)
+			tb.placeOppositeOrder(chatId, symbol, oppositeSide, qty, startTime, actualDelay)
 		}
-	case <-time.After(1 * time.Second): // Reduced from 2 seconds to 1 second
+	case <-time.After(1 * time.Second):
 		// Cancel timeout, place opposite order
-		tb.placeOppositeOrder(chatId, symbol, oppositeSide, qty, startTime)
+		tb.placeOppositeOrder(chatId, symbol, oppositeSide, qty, startTime, actualDelay)
 	}
 }
 
 // Place opposite order to close position
-func (tb *TradingBot) placeOppositeOrder(chatId int64, symbol, side, qty string, startTime time.Time) {
+func (tb *TradingBot) placeOppositeOrder(chatId int64, symbol, side, qty string, startTime time.Time, actualDelay time.Duration) {
 	closeReqId := generateReqId()
 	closeMsg := buildOrderMessage(closeReqId, symbol, side, qty)
 
@@ -568,12 +579,13 @@ func (tb *TradingBot) placeOppositeOrder(chatId int64, symbol, side, qty string,
 	case closeResp := <-closeRespChan:
 		closeDuration := time.Since(startTime)
 		if closeResp.RetCode == 0 {
-			sendMessage(chatId, fmt.Sprintf("🔄 Closed with opposite order!\n⚡ Close: %.3f ms",
-				float64(closeDuration.Nanoseconds())/1000000.0))
+			sendMessage(chatId, fmt.Sprintf("🔄 Closed with opposite order!\n⚡ Close: %.3f ms\n🕐 Opened for: %.0f ms",
+				float64(closeDuration.Nanoseconds())/1000000.0,
+				float64(actualDelay.Nanoseconds())/1000000.0))
 		} else {
 			sendMessage(chatId, fmt.Sprintf("❌ Close failed: %s", closeResp.RetMsg))
 		}
-	case <-time.After(1 * time.Second): // Reduced from 2 seconds to 1 second
+	case <-time.After(1 * time.Second):
 		sendMessage(chatId, "❌ Close timeout")
 	}
 }
