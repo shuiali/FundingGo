@@ -869,7 +869,7 @@ func (tb *TradingBot) executeFundingStrategy(strategy *FundingStrategy) {
 		"⚡ Open Time: %.3f ms\n"+
 		"🆔 Order ID: %s\n"+
 		"⏰ Will hold for exactly 1000ms...",
-		float64(orderDuration.Nanoseconds())/1000000.0, orderId))
+		float64(orderDuration.Nanoseconds())/1001000.0, orderId))
 
 	// Calculate exact close time (1000ms after open)
 	targetCloseTime := orderOpenTime.Add(FUNDING_HOLD_DELAY)
