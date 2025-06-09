@@ -19,12 +19,20 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Configuration
+const (
+	FUNDING_HOLD_DELAY = 1000 * time.Millisecond // Exactly 1000ms
+)
 const (
 	BYBIT_WS_TRADE_URL  = "wss://stream.bybit.com/v5/trade"
 	BYBIT_WS_PUBLIC_URL = "wss://stream.bybit.com/v5/public/linear"
 	AUTO_CLOSE_DELAY    = 5000 * time.Millisecond // Changed to exactly 5000ms
 	ORDER_TIMEOUT       = 3 * time.Second
+
+	// Funding constants
+	FUNDING_OPEN_DELAY  = 1000 * time.Millisecond // 1 second before funding
+	FUNDING_CLOSE_DELAY = 100 * time.Millisecond  // 100ms after funding
+
+	FUNDING_TOPIC_PREFIX = "funding."
 )
 
 // Bybit credentials - SET THESE
@@ -42,13 +50,9 @@ var (
 
 // Pre-compiled message templates for zero-allocation
 var (
-	authPrefix      = []byte(`{"op":"auth","args":["`)
-	authMiddle1     = []byte(`",`)
-	authMiddle2     = []byte(`,"`)
-	authSuffix      = []byte(`"]}`)
 	cancelPrefix    = []byte(`{"reqId":"`)
 	cancelTemplate1 = []byte(`","header":{"X-BAPI-TIMESTAMP":"`)
-	cancelTemplate2 = []byte(`","X-BAPI-RECV-WINDOW":"5000"},"op":"order.cancel","args":[{"symbol":"`)
+	cancelTemplate2 = []byte(`","X-BAPI-RECV-WINDOW":"10000"},"op":"order.cancel","args":[{"symbol":"`) // Increased to 10000
 	cancelTemplate3 = []byte(`","orderId":"`)
 	cancelTemplate4 = []byte(`","category":"linear"}]}`)
 	subPrefix       = []byte(`{"op":"subscribe","args":["tickers.`)
@@ -86,13 +90,32 @@ type CancelResponse struct {
 	} `json:"data"`
 }
 
+type FundingInfo struct {
+	Symbol           string  `json:"symbol"`
+	FundingRate      float64 `json:"fundingRate,string"`
+	NextFundingTime  string  `json:"nextFundingTime"`
+	FundingTimestamp int64   // Unix timestamp
+}
+
+type FundingData struct {
+	Topic string `json:"topic"`
+	Type  string `json:"type"`
+	Data  struct {
+		Symbol          string `json:"symbol"`
+		FundingRate     string `json:"fundingRate"`
+		NextFundingTime string `json:"nextFundingTime"`
+	} `json:"data"`
+}
+
 type TradingBot struct {
-	tradeConn   *websocket.Conn
-	publicConn  *websocket.Conn
-	priceCache  sync.Map
-	connReady   int32
-	publicReady int32
-	responses   sync.Map
+	tradeConn    *websocket.Conn
+	publicConn   *websocket.Conn
+	priceCache   sync.Map
+	fundingCache sync.Map
+	strategies   sync.Map
+	connReady    int32
+	publicReady  int32
+	responses    sync.Map
 }
 
 type TradeRequest struct {
@@ -103,79 +126,107 @@ type TradeRequest struct {
 	ChatId     int64
 }
 
+type FundingStrategy struct {
+	Symbol      string
+	UsdtAmount  float64
+	Leverage    float64
+	ChatId      int64
+	NextFunding time.Time
+	FundingRate float64
+	TargetSide  string
+}
+
 // Fast request ID generation
 func generateReqId() string {
 	counter := atomic.AddInt64(&reqCounter, 1)
 	return "x" + strconv.FormatInt(counter, 36)
 }
 
-// Generate signature for authentication
-func generateSignature(apiSecret string, timestamp int64) string {
-	payload := fmt.Sprintf("GET/realtime%d", timestamp)
+// Fix the signature generation - use expiry timestamp, not current timestamp
+func generateSignature(apiSecret string, expiryTimestamp int64) string {
+	// For WebSocket authentication, use the expiry timestamp in the signature
+	message := fmt.Sprintf("GET/realtime%d", expiryTimestamp)
 	h := hmac.New(sha256.New, []byte(apiSecret))
-	h.Write([]byte(payload))
-	return hex.EncodeToString(h.Sum(nil))
+	h.Write([]byte(message))
+	signature := hex.EncodeToString(h.Sum(nil))
+
+	log.Printf("🔑 Signature generation - Message: %s, Signature: %s", message, signature)
+	return signature
 }
 
-// Ultra-fast message building with zero allocations
+// Fix the buildAuthMessage function to use expiry timestamp for signature
 func buildAuthMessage(apiKey, apiSecret string) []byte {
+	// Use current timestamp in milliseconds
 	timestamp := time.Now().UnixMilli()
-	signature := generateSignature(apiSecret, timestamp)
-	timestampStr := strconv.FormatInt(timestamp, 10)
 
-	capacity := len(authPrefix) + len(apiKey) + len(authMiddle1) +
-		len(timestampStr) + len(authMiddle2) + len(signature) + len(authSuffix)
+	// For WebSocket auth, use timestamp + recv_window as expiry
+	expiryTimestamp := timestamp + 5000 // 5 seconds from now
 
-	msg := make([]byte, 0, capacity)
-	msg = append(msg, authPrefix...)
-	msg = append(msg, []byte(apiKey)...)
-	msg = append(msg, authMiddle1...)
-	msg = append(msg, []byte(timestampStr)...)
-	msg = append(msg, authMiddle2...)
-	msg = append(msg, []byte(signature)...)
-	msg = append(msg, authSuffix...)
+	// Generate signature using the EXPIRY timestamp (this is the key fix!)
+	signature := generateSignature(apiSecret, expiryTimestamp)
 
-	return msg
+	// The auth message format: ["api_key", expiry_timestamp, "signature"]
+	authJSON := fmt.Sprintf(`{"op":"auth","args":["%s",%d,"%s"]}`,
+		apiKey, expiryTimestamp, signature)
+
+	log.Printf("🔐 Auth details - API Key: %s, Current: %d, Expiry: %d, Signature: %s",
+		apiKey, timestamp, expiryTimestamp, signature)
+	log.Printf("🔐 Signature payload: GET/realtime%d", expiryTimestamp)
+
+	return []byte(authJSON)
 }
 
-func buildOrderMessage(reqId, symbol, side, qty string) []byte {
-	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+// Add test function to verify with documentation example
+func testSignatureWithDocExample() {
+	apiSecret := BYBIT_API_SECRET
 
-	// Build order with all required fields for Bybit v5
-	orderJSON := fmt.Sprintf(`{"reqId":"%s","header":{"X-BAPI-TIMESTAMP":"%s","X-BAPI-RECV-WINDOW":"5000"},"op":"order.create","args":[{"symbol":"%s","side":"%s","orderType":"Market","qty":"%s","category":"linear","timeInForce":"IOC","reduceOnly":false}]}`,
-		reqId, timestamp, symbol, side, qty)
+	// Test with the exact example from documentation
+	testApiKey := "XXXXXX"
+	testExpiry := int64(1711010121452)
+	expectedSignature := "ec71040eff72b163a36153d770b69d6637bcb29348fbfbb16c269a76595ececf"
 
-	return []byte(orderJSON)
+	// Generate signature using test values
+	testMessage := fmt.Sprintf("GET/realtime%d", testExpiry)
+	h := hmac.New(sha256.New, []byte(apiSecret))
+	h.Write([]byte(testMessage))
+	actualSignature := hex.EncodeToString(h.Sum(nil))
+
+	log.Printf("🧪 Test with doc example:")
+	log.Printf("    API Key: %s", testApiKey)
+	log.Printf("    Expiry: %d", testExpiry)
+	log.Printf("    Message: %s", testMessage)
+	log.Printf("    Expected: %s", expectedSignature)
+	log.Printf("    Actual: %s", actualSignature)
+	log.Printf("    Match: %t", actualSignature == expectedSignature)
 }
 
-func buildCancelMessage(reqId, symbol, orderId string) []byte {
-	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+// Test both signature methods
+func testBothSignatureMethods() {
+	apiSecret := BYBIT_API_SECRET
+	testExpiry := int64(1711010121452)
 
-	capacity := len(cancelPrefix) + len(reqId) + len(cancelTemplate1) +
-		len(timestamp) + len(cancelTemplate2) + len(symbol) + len(cancelTemplate3) +
-		len(orderId) + len(cancelTemplate4)
+	// Method 1: GET/realtime + timestamp
+	payload1 := fmt.Sprintf("GET/realtime%d", testExpiry)
+	h1 := hmac.New(sha256.New, []byte(apiSecret))
+	h1.Write([]byte(payload1))
+	sig1 := hex.EncodeToString(h1.Sum(nil))
+	log.Printf("🧪 Method 1 (GET/realtime): %s -> %s", payload1, sig1)
 
-	msg := make([]byte, 0, capacity)
-	msg = append(msg, cancelPrefix...)
-	msg = append(msg, []byte(reqId)...)
-	msg = append(msg, cancelTemplate1...)
-	msg = append(msg, []byte(timestamp)...)
-	msg = append(msg, cancelTemplate2...)
-	msg = append(msg, []byte(symbol)...)
-	msg = append(msg, cancelTemplate3...)
-	msg = append(msg, []byte(orderId)...)
-	msg = append(msg, cancelTemplate4...)
+	// Method 2: Just timestamp
+	payload2 := fmt.Sprintf("%d", testExpiry)
+	h2 := hmac.New(sha256.New, []byte(apiSecret))
+	h2.Write([]byte(payload2))
+	sig2 := hex.EncodeToString(h2.Sum(nil))
+	log.Printf("🧪 Method 2 (timestamp only): %s -> %s", payload2, sig2)
 
-	return msg
-}
+	// Method 3: API key + timestamp
+	payload3 := fmt.Sprintf("%s%d", BYBIT_API_KEY, testExpiry)
+	h3 := hmac.New(sha256.New, []byte(apiSecret))
+	h3.Write([]byte(payload3))
+	sig3 := hex.EncodeToString(h3.Sum(nil))
+	log.Printf("🧪 Method 3 (key+timestamp): %s -> %s", payload3, sig3)
 
-func buildSubscribeMessage(symbol string) []byte {
-	capacity := len(subPrefix) + len(symbol) + len(subSuffix)
-	msg := make([]byte, 0, capacity)
-	msg = append(msg, subPrefix...)
-	msg = append(msg, []byte(symbol)...)
-	msg = append(msg, subSuffix...)
-	return msg
+	log.Printf("🧪 Expected from docs: ec71040eff72b163a36153d770b69d6637bcb29348fbfbb16c269a76595ececf")
 }
 
 // Initialize trading bot
@@ -185,6 +236,9 @@ func NewTradingBot() *TradingBot {
 
 // Connect to WebSocket endpoints
 func (tb *TradingBot) Connect() error {
+	// Test signature generation first
+	testSignatureWithDocExample()
+
 	// Connect to trade WebSocket
 	tradeConn, _, err := websocket.DefaultDialer.Dial(BYBIT_WS_TRADE_URL, nil)
 	if err != nil {
@@ -200,21 +254,26 @@ func (tb *TradingBot) Connect() error {
 	}
 	tb.publicConn = publicConn
 
+	// Start message handlers BEFORE authentication
+	go tb.handleTradeMessages()
+	go tb.handlePublicMessages()
+
 	// Authenticate trade connection
 	authMsg := buildAuthMessage(BYBIT_API_KEY, BYBIT_API_SECRET)
+	log.Printf("🔐 Sending auth message: %s", string(authMsg))
+
 	if err := tb.tradeConn.WriteMessage(websocket.TextMessage, authMsg); err != nil {
 		return fmt.Errorf("failed to authenticate: %v", err)
 	}
 
-	// Start message handlers
-	go tb.handleTradeMessages()
-	go tb.handlePublicMessages()
+	// Wait for authentication response
+	log.Printf("⏳ Waiting for authentication...")
+	time.Sleep(3 * time.Second)
 
-	// Reduce authentication wait time from 2 seconds to 1 second
-	time.Sleep(1 * time.Second)
-	atomic.StoreInt32(&tb.connReady, 1)
+	// Set public ready immediately since it doesn't need auth
 	atomic.StoreInt32(&tb.publicReady, 1)
 
+	log.Printf("✅ Connection setup complete")
 	return nil
 }
 
@@ -230,7 +289,30 @@ func (tb *TradingBot) handleTradeMessages() {
 			return
 		}
 
-		// Ultra-fast message type detection
+		log.Printf("📡 Received trade message: %s", string(message))
+
+		// Handle authentication response
+		if bytes.Contains(message, []byte(`"op":"auth"`)) {
+			var authResp struct {
+				RetCode int    `json:"retCode"`
+				RetMsg  string `json:"retMsg"`
+				Op      string `json:"op"`
+				ConnId  string `json:"connId"`
+			}
+
+			if err := json.Unmarshal(message, &authResp); err == nil {
+				if authResp.RetCode == 0 {
+					log.Printf("✅ Authentication successful! ConnId: %s", authResp.ConnId)
+					atomic.StoreInt32(&tb.connReady, 1)
+				} else {
+					log.Printf("❌ Authentication failed! Code: %d, Message: %s", authResp.RetCode, authResp.RetMsg)
+					return
+				}
+			}
+			continue
+		}
+
+		// Ultra-fast message type detection for order responses
 		if len(message) > 20 && bytes.Contains(message, []byte(`"reqId"`)) {
 			if bytes.Contains(message, []byte(`"order.create"`)) {
 				var resp OrderResponse
@@ -269,17 +351,86 @@ func (tb *TradingBot) handlePublicMessages() {
 			return
 		}
 
-		// Debug: Log raw messages to understand the format
-		log.Printf("📡 Received message: %s", string(message))
+		// Process ticker messages (both snapshot and delta updates)
+		if bytes.Contains(message, []byte(`"topic":"tickers.`)) {
+			// Log ticker messages with funding data for debugging
+			if bytes.Contains(message, []byte(`"fundingRate"`)) {
+				log.Printf("📡 Ticker with funding: %s", string(message))
+			}
 
-		// Ultra-fast ticker detection with multiple patterns
-		if len(message) > 30 {
-			// Check for different ticker message patterns
-			if bytes.Contains(message, []byte(`"tickers"`)) ||
-				bytes.Contains(message, []byte(`"topic"`)) {
+			// Parse both price and funding data from the message
+			var tickerData struct {
+				Topic string `json:"topic"`
+				Type  string `json:"type"`
+				Data  struct {
+					Symbol          string `json:"symbol"`
+					LastPrice       string `json:"lastPrice"`
+					MarkPrice       string `json:"markPrice"`
+					NextFundingTime string `json:"nextFundingTime"`
+					FundingRate     string `json:"fundingRate"`
+				} `json:"data"`
+			}
 
-				// Try multiple parsing approaches
-				tb.parseTickerMessage(message)
+			if err := json.Unmarshal(message, &tickerData); err == nil {
+				symbol := tickerData.Data.Symbol
+
+				// If symbol is empty but we have topic, extract symbol from topic
+				if symbol == "" && strings.HasPrefix(tickerData.Topic, "tickers.") {
+					symbol = strings.TrimPrefix(tickerData.Topic, "tickers.")
+				}
+
+				if symbol != "" {
+					// Process price data - use lastPrice if available, otherwise markPrice
+					if tickerData.Data.LastPrice != "" {
+						if price, err := strconv.ParseFloat(tickerData.Data.LastPrice, 64); err == nil && price > 0 {
+							tb.priceCache.Store(symbol, price)
+							log.Printf("💰 Price updated: %s = %.8f", symbol, price)
+						}
+					} else if tickerData.Data.MarkPrice != "" {
+						// Fallback to mark price if last price isn't available
+						if price, err := strconv.ParseFloat(tickerData.Data.MarkPrice, 64); err == nil && price > 0 {
+							tb.priceCache.Store(symbol, price)
+							log.Printf("💰 Mark price updated: %s = %.8f", symbol, price)
+						}
+					}
+
+					// Process funding data if available
+					if tickerData.Data.FundingRate != "" {
+						rate, err := strconv.ParseFloat(tickerData.Data.FundingRate, 64)
+						if err == nil {
+							// Process next funding time if available
+							var nextFundingTime time.Time
+							var fundingTimestamp int64
+
+							if tickerData.Data.NextFundingTime != "" {
+								fundingTimeMs, err := strconv.ParseInt(tickerData.Data.NextFundingTime, 10, 64)
+								if err == nil {
+									nextFundingTime = time.Unix(fundingTimeMs/1000, 0)
+									fundingTimestamp = nextFundingTime.Unix()
+								}
+							}
+
+							// Only store if we have a valid funding time
+							if !nextFundingTime.IsZero() {
+								info := FundingInfo{
+									Symbol:           symbol,
+									FundingRate:      rate,
+									NextFundingTime:  nextFundingTime.Format("2006-01-02T15:04:05Z"),
+									FundingTimestamp: fundingTimestamp,
+								}
+
+								tb.fundingCache.Store(symbol, info)
+								log.Printf("💰 Updated funding for %s: Rate=%.6f%%, Next=%s",
+									symbol, rate*100, nextFundingTime.Format("15:04:05 MST"))
+
+								// Update any active strategies for this symbol
+								if strategy, ok := tb.strategies.Load(symbol); ok {
+									tb.updateFundingStrategy(strategy.(*FundingStrategy), info)
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -287,116 +438,91 @@ func (tb *TradingBot) handlePublicMessages() {
 
 // Enhanced ticker parsing with fallback methods
 func (tb *TradingBot) parseTickerMessage(message []byte) {
-	// Method 1: Try the standard TickerData structure
-	var tickerData TickerData
-	if json.Unmarshal(message, &tickerData) == nil {
-		if tickerData.Data.Symbol != "" && tickerData.Data.Price > 0 {
-			tb.priceCache.Store(tickerData.Data.Symbol, tickerData.Data.Price)
-			log.Printf("✅ Price updated: %s = %.8f", tickerData.Data.Symbol, tickerData.Data.Price)
-			return
-		}
-	}
-
-	// Method 2: Try alternative ticker structure
-	var altTicker struct {
+	var tickerData struct {
 		Topic string `json:"topic"`
 		Type  string `json:"type"`
 		Data  struct {
-			Symbol     string `json:"symbol"`
-			LastPrice  string `json:"lastPrice"`
-			MarkPrice  string `json:"markPrice"`
-			IndexPrice string `json:"indexPrice"`
-			Bid1Price  string `json:"bid1Price"`
-			Ask1Price  string `json:"ask1Price"`
+			Symbol          string `json:"symbol"`
+			LastPrice       string `json:"lastPrice"`
+			NextFundingTime string `json:"nextFundingTime"`
+			FundingRate     string `json:"fundingRate"`
+			MarkPrice       string `json:"markPrice"`
 		} `json:"data"`
 	}
 
-	if json.Unmarshal(message, &altTicker) == nil {
-		symbol := altTicker.Data.Symbol
-		if symbol != "" {
-			// Try different price fields in order of preference
-			var price float64
-			var err error
-			var priceSource string
+	if err := json.Unmarshal(message, &tickerData); err == nil && tickerData.Data.Symbol != "" {
+		symbol := tickerData.Data.Symbol
 
-			if altTicker.Data.LastPrice != "" && altTicker.Data.LastPrice != "0" {
-				price, err = strconv.ParseFloat(altTicker.Data.LastPrice, 64)
-				priceSource = "lastPrice"
-			} else if altTicker.Data.MarkPrice != "" && altTicker.Data.MarkPrice != "0" {
-				price, err = strconv.ParseFloat(altTicker.Data.MarkPrice, 64)
-				priceSource = "markPrice"
-			} else if altTicker.Data.Bid1Price != "" && altTicker.Data.Bid1Price != "0" {
-				price, err = strconv.ParseFloat(altTicker.Data.Bid1Price, 64)
-				priceSource = "bid1Price"
-			} else if altTicker.Data.Ask1Price != "" && altTicker.Data.Ask1Price != "0" {
-				price, err = strconv.ParseFloat(altTicker.Data.Ask1Price, 64)
-				priceSource = "ask1Price"
-			} else if altTicker.Data.IndexPrice != "" && altTicker.Data.IndexPrice != "0" {
-				price, err = strconv.ParseFloat(altTicker.Data.IndexPrice, 64)
-				priceSource = "indexPrice"
-			}
+		// Always try to parse and store price first
+		if price, err := strconv.ParseFloat(tickerData.Data.LastPrice, 64); err == nil && price > 0 {
+			tb.priceCache.Store(symbol, price)
+			log.Printf("💰 Price updated: %s = %.8f", symbol, price)
+		}
 
-			if err == nil && price > 0 {
-				tb.priceCache.Store(symbol, price)
-				log.Printf("✅ Price updated (%s): %s = %.8f", priceSource, symbol, price)
-				return
+		// Then parse funding data if available
+		if tickerData.Data.FundingRate != "" && tickerData.Data.NextFundingTime != "" {
+			rate, err := strconv.ParseFloat(tickerData.Data.FundingRate, 64)
+			if err == nil {
+				fundingTimeMs, err := strconv.ParseInt(tickerData.Data.NextFundingTime, 10, 64)
+				if err == nil {
+					nextTime := time.Unix(fundingTimeMs/1000, 0)
+
+					info := FundingInfo{
+						Symbol:           symbol,
+						FundingRate:      rate,
+						NextFundingTime:  nextTime.Format("2006-01-02T15:04:05Z"),
+						FundingTimestamp: nextTime.Unix(),
+					}
+
+					tb.fundingCache.Store(symbol, info)
+					log.Printf("💰 Updated funding for %s: Rate=%.6f%%, Next=%s",
+						symbol, rate*100, nextTime.Format("15:04:05 MST"))
+				}
 			}
 		}
+		return // Successfully parsed main format
 	}
 
-	// Method 3: Generic JSON parsing for debugging
-	var genericData map[string]interface{}
-	if json.Unmarshal(message, &genericData) == nil {
-		log.Printf("🔍 Message structure: %+v", genericData)
+	// Only try fallbacks if main parsing failed
+	log.Printf("📡 Using fallback parser for: %s", string(message))
+
+	// Try simpler format
+	var simpleData struct {
+		Topic string `json:"topic"`
+		Data  struct {
+			Symbol    string `json:"symbol"`
+			LastPrice string `json:"lastPrice"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(message, &simpleData); err == nil && simpleData.Data.Symbol != "" {
+		if price, err := strconv.ParseFloat(simpleData.Data.LastPrice, 64); err == nil && price > 0 {
+			tb.priceCache.Store(simpleData.Data.Symbol, price)
+			log.Printf("💰 Price updated (simple): %s = %.8f", simpleData.Data.Symbol, price)
+		}
 	}
 }
 
-// Enhanced subscription with confirmation
-func (tb *TradingBot) SubscribeToSymbol(symbol string) error {
-	if atomic.LoadInt32(&tb.publicReady) != 1 {
-		return fmt.Errorf("public connection not ready")
-	}
+// Remove unused variables and functions to clean up warnings
+// Remove these unused variables:
+// var (
+//     authPrefix      = []byte(`{"op":"auth","args":["`)
+//     authMiddle1     = []byte(`",`)
+//     authMiddle2     = []byte(`,"`)
+//     authSuffix      = []byte(`"]}`)
+// )
 
-	log.Printf("🔔 Subscribing to %s...", symbol)
-	subMsg := buildSubscribeMessage(symbol)
+// Remove unused functions
+// func buildOrderMessage(reqId, symbol, side, qty string) []byte {
+// }
 
-	if err := tb.publicConn.WriteMessage(websocket.TextMessage, subMsg); err != nil {
-		return err
-	}
+// func buildCancelMessage(reqId, symbol, orderId string) []byte {
+// }
 
-	// Remove the 500ms sleep - it's unnecessary!
-	// time.Sleep(500 * time.Millisecond)
+// func buildSubscribeMessage(symbol string) []byte {
+// }
 
-	// Check if we received price data (non-blocking)
-	if _, exists := tb.priceCache.Load(symbol); exists {
-		log.Printf("✅ %s price data confirmed", symbol)
-	} else {
-		log.Printf("🔔 %s subscription sent", symbol)
-	}
-
-	return nil
-}
-
-// Enhanced price retrieval with debug info
-func (tb *TradingBot) GetPrice(symbol string) (float64, error) {
-	if price, ok := tb.priceCache.Load(symbol); ok {
-		priceFloat := price.(float64)
-		log.Printf("💰 Retrieved price for %s: %.8f", symbol, priceFloat)
-		return priceFloat, nil
-	}
-
-	// Debug: Show what symbols we have
-	log.Printf("❌ No price for %s. Available symbols:", symbol)
-	tb.priceCache.Range(func(key, value interface{}) bool {
-		log.Printf("   - %s: %.8f", key.(string), value.(float64))
-		return true
-	})
-
-	return 0, fmt.Errorf("price not available for %s", symbol)
-}
-
-// Enhanced quantity calculation with proper formatting
-func formatQuantity(qty float64, symbol string) string {
+// Update formatQuantity to remove unused parameter
+func formatQuantity(qty float64) string {
 	// Round to nearest integer for quantities >= 10
 	if qty >= 10 {
 		return fmt.Sprintf("%.0f", math.Round(qty))
@@ -411,13 +537,83 @@ func formatQuantity(qty float64, symbol string) string {
 	return fmt.Sprintf("%.3f", math.Round(qty*1000)/1000)
 }
 
+// Add this function after the formatQuantity function
+func formatDuration(d time.Duration) string {
+	if d < 0 {
+		return "already passed"
+	}
+
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm %ds", hours, minutes, seconds)
+	} else if minutes > 0 {
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	} else {
+		return fmt.Sprintf("%ds", seconds)
+	}
+}
+
+func (tb *TradingBot) ultraFastClose(chatId int64, symbol, orderId string,
+	cancelReqId, closeReqId string, cancelMsg, closeMsg []byte,
+	startTime time.Time, actualDelay time.Duration) {
+
+	// Setup response channels for both operations
+	cancelRespChan := make(chan CancelResponse, 1)
+	closeRespChan := make(chan OrderResponse, 1)
+	tb.responses.Store(cancelReqId, cancelRespChan)
+	tb.responses.Store(closeReqId, closeRespChan)
+	defer func() {
+		tb.responses.Delete(cancelReqId)
+		tb.responses.Delete(closeReqId)
+	}()
+
+	// Send cancel immediately
+	tb.tradeConn.WriteMessage(websocket.TextMessage, cancelMsg)
+
+	// Wait very briefly for cancel response
+	select {
+	case cancelResp := <-cancelRespChan:
+		closeDuration := time.Since(startTime)
+		if cancelResp.RetCode == 0 {
+			// Cancel successful
+			go sendMessage(chatId, fmt.Sprintf("✅ Cancelled successfully!\n⚡ Cancel: %.3f ms\n🕐 Opened for: %.0f ms",
+				float64(closeDuration.Nanoseconds())/1000000.0,
+				float64(actualDelay.Nanoseconds())/1000000.0))
+			return
+		}
+		// Cancel failed, fall through to opposite order
+	case <-time.After(50 * time.Millisecond): // Very short timeout
+		// Cancel timeout, place opposite order
+	}
+
+	// Cancel failed or timed out, place opposite order
+	tb.tradeConn.WriteMessage(websocket.TextMessage, closeMsg)
+
+	select {
+	case closeResp := <-closeRespChan:
+		closeDuration := time.Since(startTime)
+		if closeResp.RetCode == 0 {
+			go sendMessage(chatId, fmt.Sprintf("🔄 Closed with opposite order!\n⚡ Close: %.3f ms\n🕐 Opened for: %.0f ms",
+				float64(closeDuration.Nanoseconds())/1000000.0,
+				float64(actualDelay.Nanoseconds())/1000000.0))
+		} else {
+			go sendMessage(chatId, fmt.Sprintf("❌ Close failed: %s", closeResp.RetMsg))
+		}
+	case <-time.After(200 * time.Millisecond):
+		go sendMessage(chatId, "❌ Close timeout")
+	}
+}
+
 // Ultra-optimized trade execution with minimal latency
 func (tb *TradingBot) ExecuteTrade(req TradeRequest) {
 	startTime := time.Now()
 
-	// Check connections
-	if atomic.LoadInt32(&tb.connReady) != 1 {
-		sendMessage(req.ChatId, "❌ Trade connection not ready")
+	// Check authentication status
+	if err := tb.checkTradeConnection(); err != nil {
+		sendMessage(req.ChatId, fmt.Sprintf("❌ %s", err.Error()))
 		return
 	}
 
@@ -439,7 +635,7 @@ func (tb *TradingBot) ExecuteTrade(req TradeRequest) {
 	}
 
 	// Format quantity properly
-	qtyStr := formatQuantity(qty, req.Symbol)
+	qtyStr := formatQuantity(qty)
 
 	// Parse back to check if it's valid
 	parsedQty, parseErr := strconv.ParseFloat(qtyStr, 64)
@@ -460,6 +656,8 @@ func (tb *TradingBot) ExecuteTrade(req TradeRequest) {
 	// Create order
 	reqId := generateReqId()
 	orderMsg := buildOrderMessage(reqId, req.Symbol, req.Side, qtyStr)
+
+	log.Printf("📤 Sending order: %s", string(orderMsg))
 
 	// Setup response channel
 	respChan := make(chan OrderResponse, 1)
@@ -542,78 +740,272 @@ func (tb *TradingBot) ExecuteTrade(req TradeRequest) {
 	}
 }
 
-// Enhanced fastClose function (keep this one)
-func (tb *TradingBot) fastClose(chatId int64, symbol, orderId, oppositeSide, qty string, preBuiltMsgs map[string][]byte) {
-	startTime := time.Now()
-
-	// Try cancel first (non-blocking)
-	if cancelMsg, exists := preBuiltMsgs["cancel"]; exists {
-		tb.tradeConn.WriteMessage(websocket.TextMessage, cancelMsg)
+// OpenPosition - opens a position and returns order details for custom closing logic
+func (tb *TradingBot) OpenPosition(req TradeRequest) (string, error) {
+	// Check authentication status
+	if err := tb.checkTradeConnection(); err != nil {
+		return "", fmt.Errorf("connection error: %s", err.Error())
 	}
 
-	// Immediately send opposite order as backup (don't wait for cancel response)
-	time.Sleep(10 * time.Millisecond) // Tiny delay
-	if closeMsg, exists := preBuiltMsgs["close"]; exists {
-		tb.tradeConn.WriteMessage(websocket.TextMessage, closeMsg)
+	// Get current price
+	price, err := tb.GetPrice(req.Symbol)
+	if err != nil {
+		return "", fmt.Errorf("price not available for %s. Use /sub %s first", req.Symbol, req.Symbol)
 	}
 
-	// Send success message asynchronously
-	go func() {
-		duration := time.Since(startTime)
-		sendMessage(chatId, fmt.Sprintf("⚡ Close: %.3f ms", float64(duration.Nanoseconds())/1000000.0))
-	}()
+	// Calculate quantity with validation
+	positionValue := req.UsdtAmount * req.Leverage
+	qty := positionValue / price
+
+	// Validate minimum order size
+	if positionValue < 5.0 {
+		return "", fmt.Errorf("minimum order value is 5 USDT (you specified %.2f USDT)", positionValue)
+	}
+
+	// Format quantity properly
+	qtyStr := formatQuantity(qty)
+
+	// Parse back to check if it's valid
+	parsedQty, parseErr := strconv.ParseFloat(qtyStr, 64)
+	if parseErr != nil || parsedQty <= 0 {
+		return "", fmt.Errorf("invalid quantity format: %s", qtyStr)
+	}
+
+	// Additional validation for very small quantities
+	if parsedQty < 0.1 {
+		return "", fmt.Errorf("quantity too small: %s (minimum ~0.1)", qtyStr)
+	}
+
+	log.Printf("📊 Position opening: Symbol=%s, Price=%.8f, Value=%.2f, Qty=%s (%.6f)",
+		req.Symbol, price, positionValue, qtyStr, parsedQty)
+
+	// Create order
+	reqId := generateReqId()
+	orderMsg := buildOrderMessage(reqId, req.Symbol, req.Side, qtyStr)
+
+	log.Printf("📤 Sending order: %s", string(orderMsg))
+
+	// Setup response channel
+	respChan := make(chan OrderResponse, 1)
+	tb.responses.Store(reqId, respChan)
+	defer tb.responses.Delete(reqId)
+
+	// Send order
+	if err := tb.tradeConn.WriteMessage(websocket.TextMessage, orderMsg); err != nil {
+		return "", fmt.Errorf("failed to send order: %v", err)
+	}
+
+	// Wait for response
+	select {
+	case resp := <-respChan:
+		if resp.RetCode != 0 {
+			return "", fmt.Errorf("order failed: %s", resp.RetMsg)
+		}
+		return resp.Data.OrderId, nil
+
+	case <-time.After(ORDER_TIMEOUT):
+		return "", fmt.Errorf("order timeout")
+	}
 }
 
-// Ultra-fast close with pre-built messages and minimal overhead
-func (tb *TradingBot) ultraFastClose(chatId int64, symbol, orderId string,
-	cancelReqId, closeReqId string, cancelMsg, closeMsg []byte,
-	startTime time.Time, actualDelay time.Duration) {
+// Updated executeFundingStrategy - opens 1s before funding, closes at exact funding time
+func (tb *TradingBot) executeFundingStrategy(strategy *FundingStrategy) {
+	now := time.Now()
+	fundingTime := strategy.NextFunding
+	openTime := fundingTime.Add(-FUNDING_OPEN_DELAY) // 1 second before funding
 
-	// Setup response channels for both operations
-	cancelRespChan := make(chan CancelResponse, 1)
-	closeRespChan := make(chan OrderResponse, 1)
-	tb.responses.Store(cancelReqId, cancelRespChan)
-	tb.responses.Store(closeReqId, closeRespChan)
-	defer func() {
-		tb.responses.Delete(cancelReqId)
-		tb.responses.Delete(closeReqId)
-	}()
-
-	// Send cancel immediately
-	tb.tradeConn.WriteMessage(websocket.TextMessage, cancelMsg)
-
-	// Wait very briefly for cancel response
-	select {
-	case cancelResp := <-cancelRespChan:
-		closeDuration := time.Since(startTime)
-		if cancelResp.RetCode == 0 {
-			// Cancel successful
-			go sendMessage(chatId, fmt.Sprintf("✅ Cancelled successfully!\n⚡ Cancel: %.3f ms\n🕐 Opened for: %.0f ms",
-				float64(closeDuration.Nanoseconds())/1000000.0,
-				float64(actualDelay.Nanoseconds())/1000000.0))
-			return
-		}
-		// Cancel failed, fall through to opposite order
-	case <-time.After(50 * time.Millisecond): // Very short timeout
-		// Cancel timeout, place opposite order
+	// Check if we missed the window
+	if now.After(fundingTime) {
+		sendMessage(strategy.ChatId, "❌ Missed funding window")
+		return
 	}
 
-	// Cancel failed or timed out, place opposite order
-	tb.tradeConn.WriteMessage(websocket.TextMessage, closeMsg)
-
-	select {
-	case closeResp := <-closeRespChan:
-		closeDuration := time.Since(startTime)
-		if closeResp.RetCode == 0 {
-			go sendMessage(chatId, fmt.Sprintf("🔄 Closed with opposite order!\n⚡ Close: %.3f ms\n🕐 Opened for: %.0f ms",
-				float64(closeDuration.Nanoseconds())/1000000.0,
-				float64(actualDelay.Nanoseconds())/1000000.0))
-		} else {
-			go sendMessage(chatId, fmt.Sprintf("❌ Close failed: %s", closeResp.RetMsg))
-		}
-	case <-time.After(200 * time.Millisecond):
-		go sendMessage(chatId, "❌ Close timeout")
+	if now.After(openTime) {
+		sendMessage(strategy.ChatId, "❌ Missed opening window (too close to funding)")
+		return
 	}
+
+	// Send notification about upcoming execution
+	timeToOpen := time.Until(openTime)
+	timeToFunding := time.Until(fundingTime)
+
+	sendMessage(strategy.ChatId, fmt.Sprintf("🎯 FUNDING STRATEGY READY!\n"+
+		"📊 %s %s %.2f USDT %.0fx\n"+
+		"💰 Rate: %.6f%%\n"+
+		"⏰ Opening in: %s\n"+
+		"🎯 Funding in: %s\n"+
+		"⚡ Will hold for exactly 1 second",
+		strategy.Symbol, strategy.TargetSide, strategy.UsdtAmount, strategy.Leverage,
+		strategy.FundingRate*100, formatDuration(timeToOpen), formatDuration(timeToFunding)))
+
+	// Wait until exactly 1 second before funding
+	log.Printf("🕐 Waiting until %s to open funding position...", openTime.Format("15:04:05.000"))
+	time.Sleep(time.Until(openTime))
+
+	// Open position with EXACT timing
+	orderOpenTime := time.Now()
+	req := TradeRequest{
+		Symbol:     strategy.Symbol,
+		Side:       strategy.TargetSide,
+		UsdtAmount: strategy.UsdtAmount,
+		Leverage:   strategy.Leverage,
+		ChatId:     strategy.ChatId,
+	}
+
+	sendMessage(strategy.ChatId, fmt.Sprintf("🎯 OPENING FUNDING POSITION!\n"+
+		"⏰ T-1s: Opening now...\n"+
+		"🎯 Will close at exact funding time"))
+
+	orderId, err := tb.OpenPosition(req)
+	if err != nil {
+		sendMessage(strategy.ChatId, fmt.Sprintf("❌ Failed to open funding position: %s", err.Error()))
+		return
+	}
+
+	orderDuration := time.Since(orderOpenTime)
+
+	// Send confirmation
+	sendMessage(strategy.ChatId, fmt.Sprintf("✅ FUNDING POSITION OPENED!\n"+
+		"⚡ Open Time: %.3f ms\n"+
+		"🆔 Order ID: %s\n"+
+		"⏰ Will hold for exactly 1000ms...",
+		float64(orderDuration.Nanoseconds())/1000000.0, orderId))
+
+	// Calculate exact close time (1000ms after open)
+	targetCloseTime := orderOpenTime.Add(FUNDING_HOLD_DELAY)
+
+	// Use high-precision timer for exactly 1000ms
+	timer := time.NewTimer(time.Until(targetCloseTime))
+
+	<-timer.C
+	closeStartTime := time.Now()
+	actualDelay := closeStartTime.Sub(orderOpenTime)
+
+	// Close position with pre-built messages for ultra-fast execution
+	oppositeSide := "Sell"
+	if strategy.TargetSide == "Sell" {
+		oppositeSide = "Buy"
+	}
+
+	qtyStr := formatQuantity(strategy.UsdtAmount * strategy.Leverage / tb.mustGetPrice(strategy.Symbol))
+
+	// Pre-build close messages
+	cancelReqId := generateReqId()
+	closeReqId := generateReqId()
+	cancelMsg := buildCancelMessage(cancelReqId, strategy.Symbol, orderId)
+	closeMsg := buildOrderMessage(closeReqId, strategy.Symbol, oppositeSide, qtyStr)
+
+	// Execute ultra-fast close
+	tb.ultraFastClose(strategy.ChatId, strategy.Symbol, orderId, cancelReqId, closeReqId,
+		cancelMsg, closeMsg, closeStartTime, actualDelay)
+}
+
+// Updated ExecuteTestTrade - holds position for exactly 1 second
+func (tb *TradingBot) ExecuteTestTrade(req TradeRequest) {
+	// Send initial notification
+	sendMessage(req.ChatId, fmt.Sprintf("🧪 TEST TRADE STARTING!\n"+
+		"📊 %s %s %.2f USDT %.0fx\n"+
+		"⚡ Will hold for exactly 1 second...",
+		req.Symbol, req.Side, req.UsdtAmount, req.Leverage))
+
+	// Open position
+	orderOpenTime := time.Now()
+	orderId, err := tb.OpenPosition(req)
+	if err != nil {
+		sendMessage(req.ChatId, fmt.Sprintf("❌ Test trade failed: %s", err.Error()))
+		return
+	}
+
+	orderDuration := time.Since(orderOpenTime)
+
+	// Send success message
+	sendMessage(req.ChatId, fmt.Sprintf("✅ TEST POSITION OPENED!\n"+
+		"⚡ Open Time: %.3f ms\n"+
+		"🆔 Order ID: %s\n"+
+		"⏰ Holding for exactly 1 second...",
+		float64(orderDuration.Nanoseconds())/1000000.0, orderId))
+
+	// Calculate exact close time (1000ms after open)
+	targetCloseTime := orderOpenTime.Add(FUNDING_HOLD_DELAY)
+
+	// Use high-precision timer
+	timer := time.NewTimer(time.Until(targetCloseTime))
+
+	<-timer.C
+	closeStartTime := time.Now()
+	actualDelay := closeStartTime.Sub(orderOpenTime)
+
+	// Close position with pre-built messages
+	oppositeSide := "Sell"
+	if req.Side == "Sell" {
+		oppositeSide = "Buy"
+	}
+
+	price := tb.mustGetPrice(req.Symbol)
+	qtyStr := formatQuantity(req.UsdtAmount * req.Leverage / price)
+
+	// Pre-build close messages
+	cancelReqId := generateReqId()
+	closeReqId := generateReqId()
+	cancelMsg := buildCancelMessage(cancelReqId, req.Symbol, orderId)
+	closeMsg := buildOrderMessage(closeReqId, req.Symbol, oppositeSide, qtyStr)
+
+	// Execute ultra-fast close
+	tb.ultraFastClose(req.ChatId, req.Symbol, orderId, cancelReqId, closeReqId,
+		cancelMsg, closeMsg, closeStartTime, actualDelay)
+}
+
+// Helper function to get price (must exist)
+func (tb *TradingBot) mustGetPrice(symbol string) float64 {
+	if price, exists := tb.priceCache.Load(symbol); exists {
+		return price.(float64)
+	}
+	return 0 // This should not happen if validation was done properly
+}
+
+// Updated ExecuteFundingTrade - uses precise timing like funding strategy
+func (tb *TradingBot) ExecuteFundingTrade(req TradeRequest) {
+	startTime := time.Now()
+
+	// Send initial notification
+	sendMessage(req.ChatId, fmt.Sprintf("🎯 FUNDING-STYLE TRADE!\n"+
+		"📊 %s %s %.2f USDT %.0fx\n"+
+		"⚡ Will hold for exactly 1 second...",
+		req.Symbol, req.Side, req.UsdtAmount, req.Leverage))
+
+	// Open position
+	orderOpenTime := time.Now()
+	orderId, err := tb.OpenPosition(req)
+	if err != nil {
+		sendMessage(req.ChatId, fmt.Sprintf("❌ Funding trade failed: %s", err.Error()))
+		return
+	}
+
+	orderDuration := time.Since(orderOpenTime)
+
+	// Send success message
+	sendMessage(req.ChatId, fmt.Sprintf("🎯 FUNDING POSITION OPENED!\n"+
+		"⚡ Open Time: %.3f ms\n"+
+		"🆔 Order ID: %s\n"+
+		"⏰ Holding for exactly 1 second...",
+		float64(orderDuration.Nanoseconds())/1000000.0, orderId))
+
+	// Hold for exactly 1 second (simulating funding hold period)
+	time.Sleep(1 * time.Second)
+
+	// Close position
+	sendMessage(req.ChatId, "🎯 Closing after funding-style hold!")
+
+	oppositeSide := "Sell"
+	if req.Side == "Sell" {
+		oppositeSide = "Buy"
+	}
+
+	price := tb.mustGetPrice(req.Symbol)
+	qtyStr := formatQuantity(req.UsdtAmount * req.Leverage / price)
+
+	tb.immediateClose(req.ChatId, req.Symbol, orderId, oppositeSide, qtyStr,
+		startTime, orderOpenTime, "FUNDING")
 }
 
 // Telegram message handler
@@ -642,12 +1034,19 @@ func handleUpdates(tb *TradingBot) {
 			case "start":
 				msg := "🚀 Ultra-Fast Bybit Trading Bot\n\n" +
 					"Commands:\n" +
-					"/sub <SYMBOL> - Subscribe to price updates\n" +
+					"/sub <SYMBOL> - Subscribe to price & funding\n" +
 					"/trade <SYMBOL> <BUY/SELL> <USDT> <LEVERAGE> - Execute trade\n" +
+					"/funding <SYMBOL> - Show funding info\n" +
+					"/strategy <SYMBOL> <USDT> <LEVERAGE> - Set funding strategy (auto-tests)\n" +
+					"/test <SYMBOL> <USDT> <LEVERAGE> - Manual test trade\n" +
+					"/strategies - List active strategies\n" +
+					"/fundings - List all funding rates\n" +
 					"/status - Connection status\n" +
 					"/prices - Show cached prices\n" +
 					"/debug <SYMBOL> - Debug symbol info\n\n" +
-					"Example: /trade BTCUSDT BUY 10 2"
+					"Examples:\n" +
+					"/trade BTCUSDT BUY 10 2\n" +
+					"/strategy BTCUSDT 10 2 (automatically tests!)"
 				sendMessage(chatId, msg)
 
 			case "debug":
@@ -666,7 +1065,7 @@ func handleUpdates(tb *TradingBot) {
 					// Test calculation
 					testValue := 6.0 * 2.0 // 6 USDT * 2x leverage
 					testQty := testValue / priceFloat
-					testQtyStr := formatQuantity(testQty, symbol)
+					testQtyStr := formatQuantity(testQty) // FIXED: Removed symbol parameter
 
 					msg := fmt.Sprintf("🔍 Debug %s:\n"+
 						"💰 Cached Price: %.8f\n"+
@@ -781,6 +1180,128 @@ func handleUpdates(tb *TradingBot) {
 				}
 
 				go tb.ExecuteTrade(req)
+
+			case "funding":
+				args := strings.Fields(text)
+				if len(args) != 2 {
+					sendMessage(chatId, "Usage: /funding <SYMBOL>\nExample: /funding BTCUSDT")
+					continue
+				}
+
+				symbol := strings.ToUpper(args[1])
+				if fundingInfo, exists := tb.fundingCache.Load(symbol); exists {
+					info := fundingInfo.(FundingInfo)
+					nextTime := time.Unix(info.FundingTimestamp, 0)
+					timeLeft := time.Until(nextTime)
+
+					msg := fmt.Sprintf("💰 %s Funding Info:\n"+
+						"📊 Rate: %.6f%%\n"+
+						"⏰ Next: %s\n"+
+						"⏳ Time Left: %s",
+						symbol, info.FundingRate*100,
+						nextTime.Format("15:04:05 MST"),
+						formatDuration(timeLeft))
+					sendMessage(chatId, msg)
+				} else {
+					sendMessage(chatId, fmt.Sprintf("❌ No funding data for %s. Use /sub first.", symbol))
+				}
+
+			case "strategy":
+				args := strings.Fields(text)
+				if len(args) != 4 {
+					sendMessage(chatId, "Usage: /strategy <SYMBOL> <USDT> <LEVERAGE>\n"+
+						"Example: /strategy BTCUSDT 10 2")
+					continue
+				}
+
+				symbol := strings.ToUpper(args[1])
+				usdtAmount, err := strconv.ParseFloat(args[2], 64)
+				if err != nil || usdtAmount <= 0 {
+					sendMessage(chatId, "❌ Invalid USDT amount")
+					continue
+				}
+
+				leverage, err := strconv.ParseFloat(args[3], 64)
+				if err != nil || leverage <= 0 {
+					sendMessage(chatId, "❌ Invalid leverage")
+					continue
+				}
+
+				tb.setupFundingStrategy(chatId, symbol, usdtAmount, leverage)
+
+			case "strategies":
+				var stratList []string
+				tb.strategies.Range(func(key, value interface{}) bool {
+					symbol := key.(string)
+					strategy := value.(*FundingStrategy)
+					timeLeft := time.Until(strategy.NextFunding)
+					stratList = append(stratList, fmt.Sprintf(
+						"%s: %.2f USDT %.0fx %s (%.6f%%) in %s",
+						symbol, strategy.UsdtAmount, strategy.Leverage,
+						strategy.TargetSide, strategy.FundingRate*100,
+						formatDuration(timeLeft)))
+					return true
+				})
+
+				if len(stratList) == 0 {
+					sendMessage(chatId, "📊 No active funding strategies")
+				} else {
+					msg := "📊 Active Funding Strategies:\n" + strings.Join(stratList, "\n")
+					sendMessage(chatId, msg)
+				}
+
+			case "fundings":
+				var fundingList []string
+				tb.fundingCache.Range(func(key, value interface{}) bool {
+					symbol := key.(string)
+					info := value.(FundingInfo)
+					nextTime := time.Unix(info.FundingTimestamp, 0)
+					timeLeft := time.Until(nextTime)
+
+					fundingList = append(fundingList, fmt.Sprintf(
+						"%s: %.6f%% in %s",
+						symbol, info.FundingRate*100, formatDuration(timeLeft)))
+					return true
+				})
+
+				if len(fundingList) == 0 {
+					sendMessage(chatId, "📊 No funding data cached yet")
+				} else {
+					msg := "💰 Cached Funding Rates:\n" + strings.Join(fundingList, "\n")
+					sendMessage(chatId, msg)
+				}
+
+			case "auth":
+				if atomic.LoadInt32(&tb.connReady) == 1 {
+					sendMessage(chatId, "✅ Trade connection authenticated")
+				} else {
+					sendMessage(chatId, "❌ Trade connection not authenticated")
+
+					// Show current auth details for debugging
+					timestamp := time.Now().UnixMilli()
+					expiryTimestamp := timestamp + 10000
+					signature := generateSignature(BYBIT_API_SECRET, expiryTimestamp)
+
+					debugMsg := fmt.Sprintf("🔐 Debug Auth Info:\n"+
+						"API Key: %s\n"+
+						"Current Time: %d\n"+
+						"Expiry Time: %d\n"+
+						"Signature: %s\n"+
+						"Payload: GET/realtime%d",
+						BYBIT_API_KEY, timestamp, expiryTimestamp, signature, expiryTimestamp)
+
+					sendMessage(chatId, debugMsg)
+
+					// Try to re-authenticate
+					authMsg := buildAuthMessage(BYBIT_API_KEY, BYBIT_API_SECRET)
+					log.Printf("🔐 Re-sending auth message: %s", string(authMsg))
+
+					if err := tb.tradeConn.WriteMessage(websocket.TextMessage, authMsg); err != nil {
+						sendMessage(chatId, fmt.Sprintf("❌ Failed to re-authenticate: %v", err))
+					} else {
+						sendMessage(chatId, "🔄 Re-authentication sent, waiting for response...")
+					}
+				}
 			}
 		}
 	}
@@ -799,11 +1320,204 @@ func main() {
 	// Initialize trading bot
 	tb := NewTradingBot()
 	if err := tb.Connect(); err != nil {
-		log.Fatal("Failed to connect to Bybit:", err)
+		log.Fatal("Failed to connect trading bot:", err)
 	}
 
-	log.Println("🚀 Ultra-Fast Bybit Trading Bot started successfully!")
-
-	// Handle Telegram updates
+	// Start handling Telegram updates
 	handleUpdates(tb)
+}
+
+// SubscribeToSymbol subscribes to ticker updates for a symbol
+func (tb *TradingBot) SubscribeToSymbol(symbol string) error {
+	tickerMsg := buildSubscribeMessage(symbol)
+
+	if err := tb.publicConn.WriteMessage(websocket.TextMessage, tickerMsg); err != nil {
+		return fmt.Errorf("failed to subscribe to ticker: %v", err)
+	}
+
+	// Wait for initial data - just a short wait for the first message
+	time.Sleep(500 * time.Millisecond)
+
+	// Check if price data exists
+	_, priceExists := tb.priceCache.Load(symbol)
+
+	if priceExists {
+		log.Printf("✅ %s subscription confirmed with price data", symbol)
+	} else {
+		log.Printf("⏳ %s subscription active, waiting for first ticker message...", symbol)
+	}
+
+	return nil
+}
+
+// updateFundingStrategy updates an existing strategy with new funding info
+func (tb *TradingBot) updateFundingStrategy(strategy *FundingStrategy, info FundingInfo) {
+	// Update strategy with new funding information
+	nextFunding := time.Unix(info.FundingTimestamp, 0)
+
+	// Only update if the new funding time is different and in the future
+	if !strategy.NextFunding.Equal(nextFunding) && nextFunding.After(time.Now()) {
+		strategy.NextFunding = nextFunding
+		strategy.FundingRate = info.FundingRate
+
+		// Update target side based on new funding rate
+		targetSide := "Buy"
+		if info.FundingRate > 0 {
+			targetSide = "Sell" // Shorts get paid when rate is positive
+		}
+		strategy.TargetSide = targetSide
+
+		// Update the strategy in the map
+		tb.strategies.Store(strategy.Symbol, strategy)
+
+		log.Printf("🔄 Updated strategy for %s: Rate=%.6f%%, Side=%s, Next=%s",
+			strategy.Symbol, info.FundingRate*100, targetSide,
+			nextFunding.Format("15:04:05 MST"))
+
+		// Send update to user
+		timeLeft := time.Until(nextFunding)
+		msg := fmt.Sprintf("🔄 STRATEGY UPDATED!\n"+
+			"📊 %s %s %.2f USDT %.0fx\n"+
+			"💰 New Rate: %.6f%%\n"+
+			"⏰ Execute in: %s",
+			strategy.Symbol, targetSide, strategy.UsdtAmount, strategy.Leverage,
+			info.FundingRate*100, formatDuration(timeLeft))
+
+		sendMessage(strategy.ChatId, msg)
+	}
+}
+
+// Add a function to check connection status before trading
+func (tb *TradingBot) checkTradeConnection() error {
+	if atomic.LoadInt32(&tb.connReady) != 1 {
+		return fmt.Errorf("trade connection not authenticated")
+	}
+	return nil
+}
+
+// Add these methods after the TradingBot struct definition
+
+// GetPrice returns the cached price for a symbol
+func (tb *TradingBot) GetPrice(symbol string) (float64, error) {
+	if price, exists := tb.priceCache.Load(symbol); exists {
+		return price.(float64), nil
+	}
+	return 0, fmt.Errorf("no price data for %s", symbol)
+}
+
+// immediateClose attempts to close a position as fast as possible
+func (tb *TradingBot) immediateClose(chatId int64, symbol, orderId, side, qty string,
+	startTime, openTime time.Time, tradeType string) {
+
+	// Create request IDs
+	cancelReqId := generateReqId()
+	closeReqId := generateReqId()
+
+	// Build messages
+	cancelMsg := buildCancelMessage(cancelReqId, symbol, orderId)
+	closeMsg := buildOrderMessage(closeReqId, symbol, side, qty)
+
+	// Execute ultra-fast close
+	tb.ultraFastClose(chatId, symbol, orderId, cancelReqId, closeReqId,
+		cancelMsg, closeMsg, startTime, time.Since(openTime))
+}
+
+// setupFundingStrategy creates or updates a funding strategy for a symbol
+func (tb *TradingBot) setupFundingStrategy(chatId int64, symbol string, usdtAmount, leverage float64) {
+	// Get funding info
+	fundingInfo, exists := tb.fundingCache.Load(symbol)
+	if !exists {
+		sendMessage(chatId, fmt.Sprintf("❌ No funding data for %s. Use /sub first.", symbol))
+		return
+	}
+
+	info := fundingInfo.(FundingInfo)
+	nextFunding := time.Unix(info.FundingTimestamp, 0)
+
+	// Determine trade side based on funding rate
+	targetSide := "Buy"
+	if info.FundingRate > 0 {
+		targetSide = "Sell" // Shorts get paid when rate is positive
+	}
+
+	// Create strategy
+	strategy := &FundingStrategy{
+		Symbol:      symbol,
+		UsdtAmount:  usdtAmount,
+		Leverage:    leverage,
+		ChatId:      chatId,
+		NextFunding: nextFunding,
+		FundingRate: info.FundingRate,
+		TargetSide:  targetSide,
+	}
+
+	// Store strategy
+	tb.strategies.Store(symbol, strategy)
+
+	// Send confirmation
+	timeLeft := time.Until(nextFunding)
+	msg := fmt.Sprintf("✅ FUNDING STRATEGY SET!\n"+
+		"📊 %s %s %.2f USDT %.0fx\n"+
+		"💰 Rate: %.6f%%\n"+
+		"⏰ Execute in: %s",
+		symbol, targetSide, usdtAmount, leverage,
+		info.FundingRate*100, formatDuration(timeLeft))
+	sendMessage(chatId, msg)
+
+	// First run a test trade with the same parameters
+	sendMessage(chatId, "🧪 Running test trade before scheduling funding trade...")
+	testReq := TradeRequest{
+		Symbol:     symbol,
+		Side:       targetSide,
+		UsdtAmount: usdtAmount,
+		Leverage:   leverage,
+		ChatId:     chatId,
+	}
+
+	// Execute test trade synchronously
+	tb.ExecuteTestTrade(testReq)
+
+	// Wait a bit after test trade
+	time.Sleep(2 * time.Second)
+
+	// If still enough time until funding, start the strategy
+	if time.Until(nextFunding) > 2*time.Minute {
+		sendMessage(chatId, "✅ Test trade completed. Starting funding strategy...")
+		go tb.executeFundingStrategy(strategy)
+	} else {
+		sendMessage(chatId, "❌ Too close to funding time after test. Will try next funding time.")
+	}
+}
+
+// buildOrderMessage creates an order message with proper timestamp handling
+func buildOrderMessage(reqId, symbol, side, qty string) []byte {
+	// Add a small buffer to account for network latency and clock drift
+	timestamp := strconv.FormatInt(time.Now().UnixMilli()+1000, 10) // Add 1 second buffer
+
+	orderJSON := fmt.Sprintf(`{"reqId":"%s","header":{"X-BAPI-TIMESTAMP":"%s","X-BAPI-RECV-WINDOW":"10000"},"op":"order.create","args":[{"symbol":"%s","side":"%s","orderType":"Market","qty":"%s","category":"linear","timeInForce":"IOC","reduceOnly":false}]}`,
+		reqId, timestamp, symbol, side, qty)
+
+	return []byte(orderJSON)
+}
+
+// buildCancelMessage creates a cancel order message with proper timestamp handling
+func buildCancelMessage(reqId, symbol, orderId string) []byte {
+	// Add a small buffer to account for network latency and clock drift
+	timestamp := strconv.FormatInt(time.Now().UnixMilli()+1000, 10) // Add 1 second buffer
+
+	cancelJSON := fmt.Sprintf(`{"reqId":"%s","header":{"X-BAPI-TIMESTAMP":"%s","X-BAPI-RECV-WINDOW":"10000"},"op":"order.cancel","args":[{"symbol":"%s","orderId":"%s","category":"linear"}]}`,
+		reqId, timestamp, symbol, orderId)
+
+	return []byte(cancelJSON)
+}
+
+// buildSubscribeMessage creates a subscription message using pre-compiled templates
+func buildSubscribeMessage(symbol string) []byte {
+	// Use the pre-compiled templates for zero-allocation
+	var buf bytes.Buffer
+	buf.Write(subPrefix)
+	buf.WriteString(symbol)
+	buf.Write(subSuffix)
+
+	return buf.Bytes()
 }
