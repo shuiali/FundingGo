@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	FUNDING_HOLD_DELAY = 1000 * time.Millisecond // Exactly 1000ms
+	FUNDING_HOLD_DELAY = 800 * time.Millisecond // Exactly 1000ms
 )
 const (
 	BYBIT_WS_TRADE_URL  = "wss://stream.bybit.com/v5/trade"
@@ -29,8 +29,8 @@ const (
 	ORDER_TIMEOUT       = 3 * time.Second
 
 	// Funding constants
-	FUNDING_OPEN_DELAY  = 1000 * time.Millisecond // 1 second before funding
-	FUNDING_CLOSE_DELAY = 100 * time.Millisecond  // 100ms after funding
+	FUNDING_OPEN_DELAY  = 800 * time.Millisecond // 1 second before funding
+	FUNDING_CLOSE_DELAY = 1 * time.Millisecond   // 100ms after funding
 
 	FUNDING_TOPIC_PREFIX = "funding."
 )
