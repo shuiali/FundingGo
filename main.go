@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,7 +22,7 @@ import (
 )
 
 const (
-	FUNDING_HOLD_DELAY = 800 * time.Millisecond // Exactly 1000ms
+	FUNDING_HOLD_DELAY = 1000 * time.Millisecond // Exactly 1000ms
 )
 const (
 	BYBIT_WS_TRADE_URL  = "wss://stream.bybit.com/v5/trade"
@@ -28,9 +30,10 @@ const (
 	AUTO_CLOSE_DELAY    = 5000 * time.Millisecond // Changed to exactly 5000ms
 	ORDER_TIMEOUT       = 3 * time.Second
 
-	// Funding constants
-	FUNDING_OPEN_DELAY  = 800 * time.Millisecond // 1 second before funding
-	FUNDING_CLOSE_DELAY = 1 * time.Millisecond   // 100ms after funding
+	// Updated funding constants
+	FUNDING_OPEN_DELAY  = 500 * time.Millisecond // Exactly 500ms before funding
+	FUNDING_CLOSE_DELAY = 100 * time.Millisecond // 100ms after funding
+	LIMIT_ORDER_OFFSET  = 0.003                  // 0.3% below/above opening price for limit orders
 
 	FUNDING_TOPIC_PREFIX = "funding."
 )
@@ -44,8 +47,9 @@ var (
 
 // Global variables
 var (
-	reqCounter int64
-	bot        *tgbotapi.BotAPI
+	reqCounter       int64
+	bot              *tgbotapi.BotAPI
+	serverTimeOffset int64 // Track difference between server and local time
 )
 
 // Pre-compiled message templates for zero-allocation
@@ -108,14 +112,16 @@ type FundingData struct {
 }
 
 type TradingBot struct {
-	tradeConn    *websocket.Conn
-	publicConn   *websocket.Conn
-	priceCache   sync.Map
-	fundingCache sync.Map
-	strategies   sync.Map
-	connReady    int32
-	publicReady  int32
-	responses    sync.Map
+	tradeConn        *websocket.Conn
+	publicConn       *websocket.Conn
+	priceCache       sync.Map
+	fundingCache     sync.Map
+	strategies       sync.Map
+	connReady        int32
+	publicReady      int32
+	responses        sync.Map
+	tradeWriteMutex  sync.Mutex
+	publicWriteMutex sync.Mutex
 }
 
 type TradeRequest struct {
@@ -154,10 +160,113 @@ func generateSignature(apiSecret string, expiryTimestamp int64) string {
 	return signature
 }
 
+// syncServerTime gets the server time from Bybit and calculates the offset
+func syncServerTime() error {
+	// Try multiple endpoints in case one fails
+	endpoints := []string{
+		"https://api.bybit.com/v5/public/time",
+		"https://api-testnet.bybit.com/v5/public/time",
+		"https://api.bybit.com/v3/public/time",
+	}
+
+	var lastErr error
+	for _, endpoint := range endpoints {
+		err := fetchTimeFromEndpoint(endpoint)
+		if err == nil {
+			// Success, no need to try other endpoints
+			return nil
+		}
+		lastErr = err
+		log.Printf("⚠️ Failed to sync time from %s: %v, trying next endpoint...", endpoint, err)
+	}
+
+	return lastErr
+}
+
+// fetchTimeFromEndpoint tries to get server time from a specific endpoint
+func fetchTimeFromEndpoint(endpoint string) error {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		return fmt.Errorf("failed to connect to time endpoint: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned status code: %d", resp.StatusCode)
+	}
+
+	// Read the entire body first to prevent EOF errors during JSON decoding
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	// Try to parse as v5 API format
+	var timeRespV5 struct {
+		RetCode int    `json:"retCode"`
+		RetMsg  string `json:"retMsg"`
+		Result  struct {
+			TimeNano   string `json:"timeNano"`
+			TimeSecond string `json:"timeSecond"`
+		} `json:"result"`
+	}
+
+	err = json.Unmarshal(bodyBytes, &timeRespV5)
+	if err == nil && timeRespV5.RetCode == 0 && timeRespV5.Result.TimeNano != "" {
+		// Successfully parsed v5 format
+		serverTimeMs, err := strconv.ParseInt(timeRespV5.Result.TimeNano[:13], 10, 64)
+		if err == nil {
+			// Calculate offset (server time - local time)
+			localTimeMs := time.Now().UnixMilli()
+			serverTimeOffset = serverTimeMs - localTimeMs
+
+			log.Printf("🕒 Time sync completed - Server: %d, Local: %d, Offset: %d ms (v5 API)",
+				serverTimeMs, localTimeMs, serverTimeOffset)
+			return nil
+		}
+	}
+
+	// Try v3 API format as fallback
+	var timeRespV3 struct {
+		RetCode int    `json:"ret_code"`
+		RetMsg  string `json:"ret_msg"`
+		TimeNow int64  `json:"time_now"`
+	}
+
+	err = json.Unmarshal(bodyBytes, &timeRespV3)
+	if err == nil && timeRespV3.TimeNow > 0 {
+		// Successfully parsed v3 format - convert to milliseconds if needed
+		serverTimeMs := timeRespV3.TimeNow
+		if serverTimeMs < 1705161987328 { // If seconds instead of milliseconds
+			serverTimeMs *= 1000
+		}
+
+		// Calculate offset
+		localTimeMs := time.Now().UnixMilli()
+		serverTimeOffset = serverTimeMs - localTimeMs
+
+		log.Printf("🕒 Time sync completed - Server: %d, Local: %d, Offset: %d ms (v3 API)",
+			serverTimeMs, localTimeMs, serverTimeOffset)
+		return nil
+	}
+
+	// Both formats failed
+	return fmt.Errorf("failed to parse server time response: unrecognized format")
+}
+
+// getServerAdjustedTimestamp returns a timestamp adjusted to match server time
+func getServerAdjustedTimestamp() int64 {
+	return time.Now().UnixMilli() + serverTimeOffset
+}
+
 // Fix the buildAuthMessage function to use expiry timestamp for signature
 func buildAuthMessage(apiKey, apiSecret string) []byte {
-	// Use current timestamp in milliseconds
-	timestamp := time.Now().UnixMilli()
+	// Use server-adjusted timestamp
+	timestamp := getServerAdjustedTimestamp()
 
 	// For WebSocket auth, use timestamp + recv_window as expiry
 	expiryTimestamp := timestamp + 5000 // 5 seconds from now
@@ -178,7 +287,8 @@ func buildAuthMessage(apiKey, apiSecret string) []byte {
 
 // Add test function to verify with documentation example
 func testSignatureWithDocExample() {
-	apiSecret := BYBIT_API_SECRET
+	// Use a test secret to match Bybit documentation example
+	testApiSecret := "chNOOS4KvNXR_Xq4k4c9qsfoKWvnDecLATCRlcBwyKDYnWgO" // Test secret from Bybit docs
 
 	// Test with the exact example from documentation
 	testApiKey := "XXXXXX"
@@ -187,7 +297,7 @@ func testSignatureWithDocExample() {
 
 	// Generate signature using test values
 	testMessage := fmt.Sprintf("GET/realtime%d", testExpiry)
-	h := hmac.New(sha256.New, []byte(apiSecret))
+	h := hmac.New(sha256.New, []byte(testApiSecret))
 	h.Write([]byte(testMessage))
 	actualSignature := hex.EncodeToString(h.Sum(nil))
 
@@ -198,6 +308,13 @@ func testSignatureWithDocExample() {
 	log.Printf("    Expected: %s", expectedSignature)
 	log.Printf("    Actual: %s", actualSignature)
 	log.Printf("    Match: %t", actualSignature == expectedSignature)
+
+	// Test with our actual credentials (just for logging)
+	ourMessage := fmt.Sprintf("GET/realtime%d", testExpiry)
+	ourHmac := hmac.New(sha256.New, []byte(BYBIT_API_SECRET))
+	ourHmac.Write([]byte(ourMessage))
+	ourSignature := hex.EncodeToString(ourHmac.Sum(nil))
+	log.Printf("    Our API Secret produces: %s", ourSignature)
 }
 
 // Test both signature methods
@@ -236,6 +353,23 @@ func NewTradingBot() *TradingBot {
 
 // Connect to WebSocket endpoints
 func (tb *TradingBot) Connect() error {
+	// Sync time with server first
+	for i := 0; i < 3; i++ { // Try up to 3 times
+		if err := syncServerTime(); err != nil {
+			log.Printf("⚠️ Warning: Failed to sync server time (attempt %d/3): %v", i+1, err)
+			if i < 2 {
+				// Wait before retrying
+				time.Sleep(time.Second)
+				continue
+			}
+			// Continue anyway on the last attempt
+			log.Printf("⚠️ Continuing without server time synchronization - might experience timestamp issues")
+		} else {
+			// Success
+			break
+		}
+	}
+
 	// Test signature generation first
 	testSignatureWithDocExample()
 
@@ -262,8 +396,11 @@ func (tb *TradingBot) Connect() error {
 	authMsg := buildAuthMessage(BYBIT_API_KEY, BYBIT_API_SECRET)
 	log.Printf("🔐 Sending auth message: %s", string(authMsg))
 
-	if err := tb.tradeConn.WriteMessage(websocket.TextMessage, authMsg); err != nil {
-		return fmt.Errorf("failed to authenticate: %v", err)
+	tb.tradeWriteMutex.Lock()
+	errAuth := tb.tradeConn.WriteMessage(websocket.TextMessage, authMsg)
+	tb.tradeWriteMutex.Unlock()
+	if errAuth != nil {
+		return fmt.Errorf("failed to authenticate: %v", errAuth)
 	}
 
 	// Wait for authentication response
@@ -317,21 +454,41 @@ func (tb *TradingBot) handleTradeMessages() {
 			if bytes.Contains(message, []byte(`"order.create"`)) {
 				var resp OrderResponse
 				if json.Unmarshal(message, &resp) == nil && resp.ReqId != "" {
-					if respChan, ok := tb.responses.Load(resp.ReqId); ok {
-						select {
-						case respChan.(chan OrderResponse) <- resp:
-						default:
+					if respChanVal, ok := tb.responses.Load(resp.ReqId); ok {
+						respChan, castOk := respChanVal.(chan OrderResponse)
+						if !castOk {
+							log.Printf("🚨 CRITICAL: Failed to cast response channel for reqId: %s", resp.ReqId)
+							continue
 						}
+						select {
+						case respChan <- resp:
+							log.Printf("📨 Sent order response for reqId %s to channel", resp.ReqId)
+						default:
+							// This case means the channel was not ready to receive (e.g., full or closed)
+							// which shouldn't happen with a buffer of 1 and immediate read after send.
+							log.Printf("⚠️ Order response for reqId %s not sent to channel (channel full or closed?)", resp.ReqId)
+						}
+					} else {
+						log.Printf("⚠️ Received order response for unknown or timed-out reqId: %s. Message: %s", resp.ReqId, string(message))
 					}
 				}
 			} else if bytes.Contains(message, []byte(`"order.cancel"`)) {
 				var resp CancelResponse
 				if json.Unmarshal(message, &resp) == nil && resp.ReqId != "" {
-					if respChan, ok := tb.responses.Load(resp.ReqId); ok {
-						select {
-						case respChan.(chan CancelResponse) <- resp:
-						default:
+					if respChanVal, ok := tb.responses.Load(resp.ReqId); ok {
+						respChan, castOk := respChanVal.(chan CancelResponse)
+						if !castOk {
+							log.Printf("🚨 CRITICAL: Failed to cast cancel response channel for reqId: %s", resp.ReqId)
+							continue
 						}
+						select {
+						case respChan <- resp:
+							log.Printf("📨 Sent cancel response for reqId %s to channel", resp.ReqId)
+						default:
+							log.Printf("⚠️ Cancel response for reqId %s not sent to channel (channel full or closed?)", resp.ReqId)
+						}
+					} else {
+						log.Printf("⚠️ Received cancel response for unknown or timed-out reqId: %s. Message: %s", resp.ReqId, string(message))
 					}
 				}
 			}
@@ -571,7 +728,13 @@ func (tb *TradingBot) ultraFastClose(chatId int64, symbol, orderId string,
 	}()
 
 	// Send cancel immediately
-	tb.tradeConn.WriteMessage(websocket.TextMessage, cancelMsg)
+	tb.tradeWriteMutex.Lock()
+	writeErr := tb.tradeConn.WriteMessage(websocket.TextMessage, cancelMsg)
+	tb.tradeWriteMutex.Unlock()
+	if writeErr != nil {
+		log.Printf("❌ ultraFastClose: Failed to send cancel message: %v", writeErr)
+		// Fall through to try opposite order, as cancel send failed
+	}
 
 	// Wait very briefly for cancel response
 	select {
@@ -590,7 +753,14 @@ func (tb *TradingBot) ultraFastClose(chatId int64, symbol, orderId string,
 	}
 
 	// Cancel failed or timed out, place opposite order
-	tb.tradeConn.WriteMessage(websocket.TextMessage, closeMsg)
+	tb.tradeWriteMutex.Lock()
+	writeErr = tb.tradeConn.WriteMessage(websocket.TextMessage, closeMsg)
+	tb.tradeWriteMutex.Unlock()
+	if writeErr != nil {
+		log.Printf("❌ ultraFastClose: Failed to send close message: %v", writeErr)
+		go sendMessage(chatId, fmt.Sprintf("❌ Close failed (send error): %v", writeErr))
+		return
+	}
 
 	select {
 	case closeResp := <-closeRespChan:
@@ -672,7 +842,10 @@ func (tb *TradingBot) ExecuteTrade(req TradeRequest) {
 
 	// Send order and record EXACT time
 	orderOpenTime := time.Now()
-	if err := tb.tradeConn.WriteMessage(websocket.TextMessage, orderMsg); err != nil {
+	tb.tradeWriteMutex.Lock()
+	err = tb.tradeConn.WriteMessage(websocket.TextMessage, orderMsg)
+	tb.tradeWriteMutex.Unlock()
+	if err != nil {
 		sendMessage(req.ChatId, fmt.Sprintf("❌ Failed to send order: %v", err))
 		return
 	}
@@ -791,7 +964,10 @@ func (tb *TradingBot) OpenPosition(req TradeRequest) (string, error) {
 	defer tb.responses.Delete(reqId)
 
 	// Send order
-	if err := tb.tradeConn.WriteMessage(websocket.TextMessage, orderMsg); err != nil {
+	tb.tradeWriteMutex.Lock()
+	err = tb.tradeConn.WriteMessage(websocket.TextMessage, orderMsg)
+	tb.tradeWriteMutex.Unlock()
+	if err != nil {
 		return "", fmt.Errorf("failed to send order: %v", err)
 	}
 
@@ -808,11 +984,156 @@ func (tb *TradingBot) OpenPosition(req TradeRequest) (string, error) {
 	}
 }
 
-// Updated executeFundingStrategy - opens 1s before funding, closes at exact funding time
+// New function to execute both market and limit orders simultaneously
+func (tb *TradingBot) executeSimultaneousFundingOrders(strategy *FundingStrategy, qty, limitPrice, oppositeSide string) (string, string) {
+	// Generate request IDs
+	marketReqId := generateReqId()
+	limitReqId := generateReqId()
+
+	// Build messages
+	marketOrderMsg := buildOrderMessage(marketReqId, strategy.Symbol, strategy.TargetSide, qty)
+	limitOrderMsg := buildLimitOrderMessage(limitReqId, strategy.Symbol, oppositeSide, qty, limitPrice)
+
+	// Setup response channels
+	marketRespChan := make(chan OrderResponse, 1)
+	limitRespChan := make(chan OrderResponse, 1)
+	tb.responses.Store(marketReqId, marketRespChan)
+	tb.responses.Store(limitReqId, limitRespChan)
+
+	defer func() {
+		tb.responses.Delete(marketReqId)
+		tb.responses.Delete(limitReqId)
+	}()
+
+	// Send both orders simultaneously using goroutines
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Send market order
+	go func() {
+		defer wg.Done()
+		tb.tradeWriteMutex.Lock()
+		err := tb.tradeConn.WriteMessage(websocket.TextMessage, marketOrderMsg)
+		tb.tradeWriteMutex.Unlock()
+		if err != nil {
+			log.Printf("❌ Failed to send market order: %v", err)
+		}
+	}()
+
+	// Send limit order
+	go func() {
+		defer wg.Done()
+		tb.tradeWriteMutex.Lock()
+		err := tb.tradeConn.WriteMessage(websocket.TextMessage, limitOrderMsg)
+		tb.tradeWriteMutex.Unlock()
+		if err != nil {
+			log.Printf("❌ Failed to send limit order: %v", err)
+		}
+	}()
+
+	// Wait for both orders to be sent
+	wg.Wait()
+
+	// Collect responses with timeout
+	var marketOrderId, limitOrderId string
+
+	// Wait for market order response (priority)
+	select {
+	case marketResp := <-marketRespChan:
+		if marketResp.RetCode == 0 {
+			marketOrderId = marketResp.Data.OrderId
+			log.Printf("✅ Market order successful: %s", marketOrderId)
+		} else {
+			log.Printf("❌ Market order failed: %s", marketResp.RetMsg)
+		}
+	case <-time.After(2 * time.Second):
+		log.Printf("❌ Market order timeout")
+	}
+
+	// Wait for limit order response
+	select {
+	case limitResp := <-limitRespChan:
+		if limitResp.RetCode == 0 {
+			limitOrderId = limitResp.Data.OrderId
+			log.Printf("✅ Limit order successful: %s", limitOrderId)
+		} else {
+			log.Printf("❌ Limit order failed: %s", limitResp.RetMsg)
+		}
+	case <-time.After(2 * time.Second):
+		log.Printf("❌ Limit order timeout")
+	}
+
+	return marketOrderId, limitOrderId
+}
+
+// Add new function to build limit order message
+func buildLimitOrderMessage(reqId, symbol, side, qty, price string) []byte {
+	// Use server-adjusted timestamp
+	timestamp := strconv.FormatInt(getServerAdjustedTimestamp(), 10)
+
+	orderJSON := fmt.Sprintf(`{"reqId":"%s","header":{"X-BAPI-TIMESTAMP":"%s","X-BAPI-RECV-WINDOW":"10000"},"op":"order.create","args":[{"symbol":"%s","side":"%s","orderType":"Limit","qty":"%s","price":"%s","category":"linear","timeInForce":"GTC","reduceOnly":true}]}`,
+		reqId, timestamp, symbol, side, qty, price)
+
+	return []byte(orderJSON)
+}
+
+// buildStopLimitOrderMessage creates a stop-limit order message.
+// stopPrice: The price at which the order is triggered.
+// price: The limit price at which the order will be placed once triggered.
+// triggerDirection: 1 for buy (trigger when price rises to or above stopPrice), 2 for sell (trigger when price falls to or below stopPrice).
+func buildStopLimitOrderMessage(reqId, symbol, side, qty, stopPrice, price string, triggerDirection int) []byte {
+	timestamp := strconv.FormatInt(getServerAdjustedTimestamp(), 10)
+	// Note: "orderType" is "Limit" for a stop-limit order. "Market" for stop-market.
+	// "price" is the limit price for the order after trigger.
+	// "stopPrice" is the trigger price.
+	orderJSON := fmt.Sprintf(`{"reqId":"%s","header":{"X-BAPI-TIMESTAMP":"%s","X-BAPI-RECV-WINDOW":"10000"},"op":"order.create","args":[{"symbol":"%s","side":"%s","orderType":"Limit","qty":"%s","price":"%s","stopPrice":"%s","category":"linear","timeInForce":"GTC","reduceOnly":true,"triggerDirection":%d}]}`,
+		reqId, timestamp, symbol, side, qty, price, stopPrice, triggerDirection)
+	return []byte(orderJSON)
+}
+
+// buildStopMarketOrderMessage creates a stop-market order message.
+// triggerPrice: The price at which the market order is triggered.
+// triggerDirection: 1 for buy (trigger when price rises to or above triggerPrice), 2 for sell (trigger when price falls to or below triggerPrice).
+func buildStopMarketOrderMessage(reqId, symbol, side, qty, triggerPrice string, triggerDirection int) []byte {
+	timestamp := strconv.FormatInt(getServerAdjustedTimestamp(), 10)
+	// For a stop-market order:
+	// "orderType" is "Market".
+	// "triggerPrice" is the price that triggers the market order.
+	// No "price" field is needed as it executes at market.
+	orderJSON := fmt.Sprintf(`{"reqId":"%s","header":{"X-BAPI-TIMESTAMP":"%s","X-BAPI-RECV-WINDOW":"10000"},"op":"order.create","args":[{"symbol":"%s","side":"%s","orderType":"Market","qty":"%s","triggerPrice":"%s","category":"linear","timeInForce":"GTC","reduceOnly":true,"triggerDirection":%d}]}`,
+		reqId, timestamp, symbol, side, qty, triggerPrice, triggerDirection)
+	return []byte(orderJSON)
+}
+
+// Helper function to format price with proper precision
+func formatPrice(price float64, symbol string) string {
+	// Most crypto pairs need different decimal places
+	// For simplicity, using a tiered approach based on price magnitude.
+	// The 'symbol' parameter is available for future enhancement (e.g., using tick size).
+	if price >= 1000 {
+		return fmt.Sprintf("%.2f", price) // e.g., 60000.12
+	} else if price >= 100 {
+		return fmt.Sprintf("%.3f", price) // e.g., 123.456
+	} else if price >= 10 {
+		return fmt.Sprintf("%.4f", price) // e.g., 12.3456
+	} else if price >= 1 {
+		return fmt.Sprintf("%.5f", price) // e.g., 1.23456
+	} else if price >= 0.1 { // For prices like 0.1xxxx
+		return fmt.Sprintf("%.5f", price) // e.g., 0.11542
+	} else if price >= 0.01 { // For prices like 0.01xxxx
+		return fmt.Sprintf("%.6f", price) // e.g., 0.012345
+	} else if price >= 0.001 { // For prices like 0.001xxxx
+		return fmt.Sprintf("%.7f", price) // e.g., 0.0012345
+	} else { // For prices < 0.001, including very small prices or zero
+		return fmt.Sprintf("%.8f", price) // e.g., 0.00012345 or 0.00000000
+	}
+}
+
+// Updated executeFundingStrategy - opens 500ms before funding, places limit order simultaneously
 func (tb *TradingBot) executeFundingStrategy(strategy *FundingStrategy) {
 	now := time.Now()
 	fundingTime := strategy.NextFunding
-	openTime := fundingTime.Add(-FUNDING_OPEN_DELAY) // 1 second before funding
+	openTime := fundingTime.Add(-FUNDING_OPEN_DELAY) // 500ms before funding
 
 	// Check if we missed the window
 	if now.After(fundingTime) {
@@ -834,178 +1155,261 @@ func (tb *TradingBot) executeFundingStrategy(strategy *FundingStrategy) {
 		"💰 Rate: %.6f%%\n"+
 		"⏰ Opening in: %s\n"+
 		"🎯 Funding in: %s\n"+
-		"⚡ Will hold for exactly 1 second",
+		"⚡ Will open 500ms before + limit close order",
 		strategy.Symbol, strategy.TargetSide, strategy.UsdtAmount, strategy.Leverage,
 		strategy.FundingRate*100, formatDuration(timeToOpen), formatDuration(timeToFunding)))
 
-	// Wait until exactly 1 second before funding
+	// Wait until exactly 500ms before funding
 	log.Printf("🕐 Waiting until %s to open funding position...", openTime.Format("15:04:05.000"))
 	time.Sleep(time.Until(openTime))
 
-	// Open position with EXACT timing
-	orderOpenTime := time.Now()
-	req := TradeRequest{
-		Symbol:     strategy.Symbol,
-		Side:       strategy.TargetSide,
-		UsdtAmount: strategy.UsdtAmount,
-		Leverage:   strategy.Leverage,
-		ChatId:     strategy.ChatId,
-	}
-
-	sendMessage(strategy.ChatId, fmt.Sprintf("🎯 OPENING FUNDING POSITION!\n"+
-		"⏰ T-1s: Opening now...\n"+
-		"🎯 Will close at exact funding time"))
-
-	orderId, err := tb.OpenPosition(req)
-	if err != nil {
-		sendMessage(strategy.ChatId, fmt.Sprintf("❌ Failed to open funding position: %s", err.Error()))
+	// Get current price for calculations
+	currentPrice, err := tb.GetPrice(strategy.Symbol)
+	if err != nil || currentPrice == 0 {
+		sendMessage(strategy.ChatId, "❌ Cannot get current price for funding strategy")
 		return
 	}
 
-	orderDuration := time.Since(orderOpenTime)
+	// Calculate quantity
+	positionValue := strategy.UsdtAmount * strategy.Leverage
+	qty := positionValue / currentPrice
+	qtyStr := formatQuantity(qty)
 
-	// Send confirmation
-	sendMessage(strategy.ChatId, fmt.Sprintf("✅ FUNDING POSITION OPENED!\n"+
-		"⚡ Open Time: %.3f ms\n"+
-		"🆔 Order ID: %s\n"+
-		"⏰ Will hold for exactly 1000ms...",
-		float64(orderDuration.Nanoseconds())/1001000.0, orderId))
+	// Calculate limit order price (0.3% below current price)
+	limitPrice := currentPrice * (1 - LIMIT_ORDER_OFFSET)
+	limitPriceStr := formatPrice(limitPrice, strategy.Symbol)
 
-	// Calculate exact close time (1000ms after open)
-	targetCloseTime := orderOpenTime.Add(FUNDING_HOLD_DELAY)
-
-	// Use high-precision timer for exactly 1000ms
-	timer := time.NewTimer(time.Until(targetCloseTime))
-
-	<-timer.C
-	closeStartTime := time.Now()
-	actualDelay := closeStartTime.Sub(orderOpenTime)
-
-	// Close position with pre-built messages for ultra-fast execution
+	// Determine opposite side for limit order
 	oppositeSide := "Sell"
 	if strategy.TargetSide == "Sell" {
 		oppositeSide = "Buy"
+		// For short positions, limit order should be 0.3% above to close
+		limitPrice = currentPrice * (1 + LIMIT_ORDER_OFFSET)
+		limitPriceStr = formatPrice(limitPrice, strategy.Symbol)
 	}
 
-	qtyStr := formatQuantity(strategy.UsdtAmount * strategy.Leverage / tb.mustGetPrice(strategy.Symbol))
+	sendMessage(strategy.ChatId, fmt.Sprintf("🎯 OPENING FUNDING POSITION!\n"+
+		"⏰ T-500ms: Opening now...\n"+
+		"💰 Open Price: %.8f\n"+
+		"🎯 Limit Close: %.8f (%.1f%% offset)",
+		currentPrice, limitPrice, LIMIT_ORDER_OFFSET*100))
 
-	// Pre-build close messages
-	cancelReqId := generateReqId()
-	closeReqId := generateReqId()
-	cancelMsg := buildCancelMessage(cancelReqId, strategy.Symbol, orderId)
-	closeMsg := buildOrderMessage(closeReqId, strategy.Symbol, oppositeSide, qtyStr)
+	// Execute both orders simultaneously
+	orderOpenTime := time.Now()
+	marketOrderId, limitOrderId := tb.executeSimultaneousFundingOrders(strategy, qtyStr, limitPriceStr, oppositeSide)
 
-	// Execute ultra-fast close
-	tb.ultraFastClose(strategy.ChatId, strategy.Symbol, orderId, cancelReqId, closeReqId,
-		cancelMsg, closeMsg, closeStartTime, actualDelay)
+	if marketOrderId == "" {
+		sendMessage(strategy.ChatId, "❌ Failed to open funding position")
+		return
+	}
+
+	orderDuration := time.Since(orderOpenTime)
+
+	if limitOrderId != "" {
+		sendMessage(strategy.ChatId, fmt.Sprintf("✅ FUNDING STRATEGY EXECUTED!\n"+
+			"⚡ Execution Time: %.3f ms\n"+
+			"🆔 Market Order: %s\n"+
+			"🎯 Limit Order: %s\n"+
+			"💰 Open: %.8f\n"+
+			"🎯 Close: %.8f\n"+
+			"⏰ Position opened 500ms before funding",
+			float64(orderDuration.Nanoseconds())/1000000.0,
+			marketOrderId, limitOrderId, currentPrice, limitPrice))
+	} else {
+		sendMessage(strategy.ChatId, fmt.Sprintf("⚠️ PARTIAL SUCCESS!\n"+
+			"✅ Market order filled: %s\n"+
+			"❌ Limit order failed\n"+
+			"⚡ Execution Time: %.3f ms",
+			marketOrderId, float64(orderDuration.Nanoseconds())/1000000.0))
+	}
 }
 
-// Updated ExecuteTestTrade - holds position for exactly 1 second
+// Updated ExecuteTestTrade - places a market open and a protective stop-market close order
 func (tb *TradingBot) ExecuteTestTrade(req TradeRequest) {
-	// Send initial notification
-	sendMessage(req.ChatId, fmt.Sprintf("🧪 TEST TRADE STARTING!\n"+
+	sendMessage(req.ChatId, fmt.Sprintf("🧪 TEST TRADE (Market Open + Protective Stop-Market Close) STARTING!\n"+
 		"📊 %s %s %.2f USDT %.0fx\n"+
-		"⚡ Will hold for exactly 1 second...",
+		"⚡ Placing market open and a reduce-only stop-market order to close.",
 		req.Symbol, req.Side, req.UsdtAmount, req.Leverage))
 
-	// Open position
-	orderOpenTime := time.Now()
-	orderId, err := tb.OpenPosition(req)
-	if err != nil {
-		sendMessage(req.ChatId, fmt.Sprintf("❌ Test trade failed: %s", err.Error()))
+	if err := tb.checkTradeConnection(); err != nil {
+		sendMessage(req.ChatId, fmt.Sprintf("❌ Test trade connection error: %s", err.Error()))
 		return
 	}
 
-	orderDuration := time.Since(orderOpenTime)
-
-	// Send success message
-	sendMessage(req.ChatId, fmt.Sprintf("✅ TEST POSITION OPENED!\n"+
-		"⚡ Open Time: %.3f ms\n"+
-		"🆔 Order ID: %s\n"+
-		"⏰ Holding for exactly 1 second...",
-		float64(orderDuration.Nanoseconds())/1000000.0, orderId))
-
-	// Calculate exact close time (1000ms after open)
-	targetCloseTime := orderOpenTime.Add(FUNDING_HOLD_DELAY)
-
-	// Use high-precision timer
-	timer := time.NewTimer(time.Until(targetCloseTime))
-
-	<-timer.C
-	closeStartTime := time.Now()
-	actualDelay := closeStartTime.Sub(orderOpenTime)
-
-	// Close position with pre-built messages
-	oppositeSide := "Sell"
-	if req.Side == "Sell" {
-		oppositeSide = "Buy"
-	}
-
-	price := tb.mustGetPrice(req.Symbol)
-	qtyStr := formatQuantity(req.UsdtAmount * req.Leverage / price)
-
-	// Pre-build close messages
-	cancelReqId := generateReqId()
-	closeReqId := generateReqId()
-	cancelMsg := buildCancelMessage(cancelReqId, req.Symbol, orderId)
-	closeMsg := buildOrderMessage(closeReqId, req.Symbol, oppositeSide, qtyStr)
-
-	// Execute ultra-fast close
-	tb.ultraFastClose(req.ChatId, req.Symbol, orderId, cancelReqId, closeReqId,
-		cancelMsg, closeMsg, closeStartTime, actualDelay)
-}
-
-// Helper function to get price (must exist)
-func (tb *TradingBot) mustGetPrice(symbol string) float64 {
-	if price, exists := tb.priceCache.Load(symbol); exists {
-		return price.(float64)
-	}
-	return 0 // This should not happen if validation was done properly
-}
-
-// Updated ExecuteFundingTrade - uses precise timing like funding strategy
-func (tb *TradingBot) ExecuteFundingTrade(req TradeRequest) {
-	startTime := time.Now()
-
-	// Send initial notification
-	sendMessage(req.ChatId, fmt.Sprintf("🎯 FUNDING-STYLE TRADE!\n"+
-		"📊 %s %s %.2f USDT %.0fx\n"+
-		"⚡ Will hold for exactly 1 second...",
-		req.Symbol, req.Side, req.UsdtAmount, req.Leverage))
-
-	// Open position
-	orderOpenTime := time.Now()
-	orderId, err := tb.OpenPosition(req)
-	if err != nil {
-		sendMessage(req.ChatId, fmt.Sprintf("❌ Funding trade failed: %s", err.Error()))
+	currentPrice, err := tb.GetPrice(req.Symbol)
+	if err != nil || currentPrice == 0 {
+		sendMessage(req.ChatId, fmt.Sprintf("❌ Test trade: Cannot get current price for %s", req.Symbol))
 		return
 	}
 
-	orderDuration := time.Since(orderOpenTime)
+	positionValue := req.UsdtAmount * req.Leverage
+	qty := positionValue / currentPrice
+	qtyStr := formatQuantity(qty)
 
-	// Send success message
-	sendMessage(req.ChatId, fmt.Sprintf("🎯 FUNDING POSITION OPENED!\n"+
-		"⚡ Open Time: %.3f ms\n"+
-		"🆔 Order ID: %s\n"+
-		"⏰ Holding for exactly 1 second...",
-		float64(orderDuration.Nanoseconds())/1000000.0, orderId))
-
-	// Hold for exactly 1 second (simulating funding hold period)
-	time.Sleep(1 * time.Second)
-
-	// Close position
-	sendMessage(req.ChatId, "🎯 Closing after funding-style hold!")
-
-	oppositeSide := "Sell"
-	if req.Side == "Sell" {
-		oppositeSide = "Buy"
+	// Validate quantity again after formatting
+	parsedQty, parseErr := strconv.ParseFloat(qtyStr, 64)
+	if parseErr != nil || parsedQty <= 0 {
+		sendMessage(req.ChatId, fmt.Sprintf("❌ Test trade: Invalid quantity format: %s", qtyStr))
+		return
+	}
+	if positionValue < 5.0 { // Minimum order value check
+		sendMessage(req.ChatId, fmt.Sprintf("❌ Test trade: Minimum order value is 5 USDT (yours: %.2f USDT)", positionValue))
+		return
 	}
 
-	price := tb.mustGetPrice(req.Symbol)
-	qtyStr := formatQuantity(req.UsdtAmount * req.Leverage / price)
+	openSide := req.Side
+	var closeSide string
+	var stopMarketTriggerPrice float64 // Renamed from limitPriceForClose
 
-	tb.immediateClose(req.ChatId, req.Symbol, orderId, oppositeSide, qtyStr,
-		startTime, orderOpenTime, "FUNDING")
+	if openSide == "Buy" { // Opening a Long position
+		closeSide = "Sell"
+		// Protective Sell Stop-Market is triggered BELOW current price
+		stopMarketTriggerPrice = currentPrice * (1 - LIMIT_ORDER_OFFSET)
+	} else { // Opening a Short position
+		closeSide = "Buy"
+		// Protective Buy Stop-Market is triggered ABOVE current price
+		stopMarketTriggerPrice = currentPrice * (1 + LIMIT_ORDER_OFFSET)
+	}
+	stopMarketTriggerPriceStr := formatPrice(stopMarketTriggerPrice, req.Symbol) // Renamed from limitPriceStr
+
+	log.Printf("🧪 Test Trade Details: Symbol=%s, OpenSide=%s, Qty=%s, EntryPrice=%.8f, CloseSide=%s, ProtectiveStopMarketTrigger=%s",
+		req.Symbol, openSide, qtyStr, currentPrice, closeSide, stopMarketTriggerPriceStr)
+
+	tb.executeMarketOpenWithProtectiveStopMarketClose(req.ChatId, req.Symbol, openSide, qtyStr, closeSide, stopMarketTriggerPriceStr, currentPrice, req.Leverage, req.UsdtAmount)
+}
+
+// executeMarketOpenWithProtectiveStopMarketClose sends a market open order and a reduce-only stop-market close order.
+func (tb *TradingBot) executeMarketOpenWithProtectiveStopMarketClose(chatId int64, symbol, marketSide, qty, stopMarketSide, stopMarketTriggerPriceStr string, entryPrice, leverage, usdtAmount float64) {
+	marketReqId := generateReqId()
+	stopMarketReqId := generateReqId() // Renamed from stopLimitReqId
+
+	marketOrderMsg := buildOrderMessage(marketReqId, symbol, marketSide, qty)
+	log.Printf("🧪 Protective Trade: Market Order Msg (reqId: %s): %s", marketReqId, string(marketOrderMsg))
+
+	marketRespChan := make(chan OrderResponse, 1)
+	stopMarketRespChan := make(chan OrderResponse, 1) // Renamed from stopLimitRespChan
+	tb.responses.Store(marketReqId, marketRespChan)
+	log.Printf("🧪 Protective Trade: Stored marketRespChan for reqId: %s", marketReqId)
+
+	defer func() {
+		tb.responses.Delete(marketReqId)
+		log.Printf("🧪 Protective Trade: Deleted marketRespChan for reqId: %s", marketReqId)
+		tb.responses.Delete(stopMarketReqId)
+		log.Printf("🧪 Protective Trade: Deleted stopMarketRespChan for reqId: %s", stopMarketReqId)
+	}()
+
+	var marketWriteErr error
+	var marketOrderSuccess bool
+	var marketOrderId string
+	var stopMarketOrderId string                        // Renamed from stopLimitOrderId
+	var marketOrderMsgStr, stopMarketOrderMsgStr string // Renamed from stopLimitOrderMsgStr
+
+	// Send market order
+	log.Printf("🧪 Protective Trade: Attempting to send market order (reqId: %s)...", marketReqId)
+	tb.tradeWriteMutex.Lock()
+	err := tb.tradeConn.WriteMessage(websocket.TextMessage, marketOrderMsg)
+	tb.tradeWriteMutex.Unlock()
+	if err != nil {
+		marketWriteErr = err
+		log.Printf("❌ Protective Trade: Failed to send market order (reqId: %s): %v", marketReqId, err)
+		marketOrderMsgStr = fmt.Sprintf("❌ Market %s Order Not Sent (Write Error: %v).", marketSide, marketWriteErr)
+	} else {
+		log.Printf("✅ Protective Trade: Market order (reqId: %s) sent successfully to WebSocket.", marketReqId)
+
+		// Process market order response
+		log.Printf("🧪 Protective Trade: Waiting for market order response (reqId: %s)...", marketReqId)
+		select {
+		case marketResp, ok := <-marketRespChan:
+			if !ok {
+				marketOrderMsgStr = fmt.Sprintf("❌ Market %s Order Failed: Response channel closed.", marketSide)
+				log.Printf("❌ Protective Trade: Market order response channel closed for reqId: %s", marketReqId)
+				break
+			}
+			log.Printf("🧪 Protective Trade: Received market order response (reqId: %s): %+v", marketReqId, marketResp)
+			if marketResp.RetCode == 0 {
+				marketOrderSuccess = true
+				marketOrderId = marketResp.Data.OrderId
+				marketOrderMsgStr = fmt.Sprintf("✅ Market %s Order [%s] placed.", marketSide, marketOrderId)
+				log.Printf("✅ Protective Trade: Market order %s successful: %s (reqId: %s)", marketSide, marketOrderId, marketReqId)
+			} else {
+				marketOrderMsgStr = fmt.Sprintf("❌ Market %s Order Failed: %s (Code: %d)", marketSide, marketResp.RetMsg, marketResp.RetCode)
+				log.Printf("❌ Protective Trade: Market order %s failed: %s (Code: %d, reqId: %s)", marketSide, marketResp.RetMsg, marketResp.RetCode, marketReqId)
+			}
+		case <-time.After(ORDER_TIMEOUT):
+			marketOrderMsgStr = fmt.Sprintf("❌ Market %s Order Timeout.", marketSide)
+			log.Printf("❌ Protective Trade: Market order %s timeout (reqId: %s)", marketSide, marketReqId)
+		}
+	}
+
+	// If market order was successful, proceed to send the stop-market order
+	if marketOrderSuccess {
+		var triggerDirection int
+
+		if stopMarketSide == "Sell" { // Protecting a long position, so stop-market is a Sell order
+			triggerDirection = 2 // Trigger when price falls to or below stopMarketTriggerPriceStr
+		} else { // Protecting a short position, so stop-market is a Buy order
+			triggerDirection = 1 // Trigger when price rises to or above stopMarketTriggerPriceStr
+		}
+		// Removed executionLimitPrice and executionLimitPriceStr calculation
+
+		stopMarketOrderMsg := buildStopMarketOrderMessage(stopMarketReqId, symbol, stopMarketSide, qty, stopMarketTriggerPriceStr, triggerDirection) // Changed from buildStopLimitOrderMessage
+		log.Printf("🧪 Protective Trade: Stop-Market Order Msg (reqId: %s): %s", stopMarketReqId, string(stopMarketOrderMsg))
+		tb.responses.Store(stopMarketReqId, stopMarketRespChan)
+		log.Printf("🧪 Protective Trade: Stored stopMarketRespChan for reqId: %s", stopMarketReqId)
+
+		var stopMarketWriteErr error
+
+		log.Printf("🧪 Protective Trade: Attempting to send stop-market order (reqId: %s)...", stopMarketReqId)
+		tb.tradeWriteMutex.Lock()
+		err = tb.tradeConn.WriteMessage(websocket.TextMessage, stopMarketOrderMsg)
+		tb.tradeWriteMutex.Unlock()
+		if err != nil {
+			stopMarketWriteErr = err
+			log.Printf("❌ Protective Trade: Failed to send stop-market order (reqId: %s): %v", stopMarketReqId, err)
+			stopMarketOrderMsgStr = fmt.Sprintf("❌ Protective Stop-Market %s Order Not Sent (Write Error: %v).", stopMarketSide, stopMarketWriteErr)
+		} else {
+			log.Printf("✅ Protective Trade: Stop-Market order (reqId: %s) sent successfully to WebSocket.", stopMarketReqId)
+
+			// Process stop-market order response
+			log.Printf("🧪 Protective Trade: Waiting for stop-market order response (reqId: %s)...", stopMarketReqId)
+			select {
+			case stopMarketResp, ok := <-stopMarketRespChan:
+				if !ok {
+					stopMarketOrderMsgStr = fmt.Sprintf("❌ Protective Stop-Market %s Order Failed: Response channel closed.", stopMarketSide)
+					log.Printf("❌ Protective Trade: Stop-Market order response channel closed for reqId: %s", stopMarketReqId)
+					break
+				}
+				log.Printf("🧪 Protective Trade: Received stop-market order response (reqId: %s): %+v", stopMarketReqId, stopMarketResp)
+				if stopMarketResp.RetCode == 0 {
+					stopMarketOrderId = stopMarketResp.Data.OrderId
+					stopMarketOrderMsgStr = fmt.Sprintf("✅ Protective Stop-Market %s Order [%s] placed. Trigger: %s.", stopMarketSide, stopMarketOrderId, stopMarketTriggerPriceStr)              // Removed Limit price
+					log.Printf("✅ Protective Trade: Stop-Market order %s successful: %s (reqId: %s). Trigger: %s", stopMarketSide, stopMarketOrderId, stopMarketReqId, stopMarketTriggerPriceStr) // Removed Limit price
+				} else {
+					stopMarketOrderMsgStr = fmt.Sprintf("❌ Protective Stop-Market %s Order Failed: %s (Code: %d)", stopMarketSide, stopMarketResp.RetMsg, stopMarketResp.RetCode)
+					log.Printf("❌ Protective Trade: Stop-Market order %s failed: %s (Code: %d, reqId: %s)", stopMarketSide, stopMarketResp.RetMsg, stopMarketResp.RetCode, stopMarketReqId)
+				}
+			case <-time.After(ORDER_TIMEOUT):
+				stopMarketOrderMsgStr = fmt.Sprintf("❌ Protective Stop-Market %s Order Timeout.", stopMarketSide)
+				log.Printf("❌ Protective Trade: Stop-Market order %s timeout (reqId: %s)", stopMarketSide, stopMarketReqId)
+			}
+		}
+	} else {
+		if marketOrderMsgStr == "" {
+			marketOrderMsgStr = "❌ Market order did not complete."
+		}
+		stopMarketOrderMsgStr = "ℹ️ Protective stop-market order not attempted due to market order failure." // Changed from stop-limit
+	}
+
+	finalMsg := fmt.Sprintf("🧪 TEST TRADE RESULT for %s %.2f USDT %.0fx:\n%s\n%s",
+		symbol, usdtAmount, leverage, marketOrderMsgStr, stopMarketOrderMsgStr)
+	if marketOrderSuccess && stopMarketOrderId != "" {
+		// Removed parsing of executionLimitPriceForMsg as it's not relevant for stop-market
+
+		finalMsg += fmt.Sprintf("\nℹ️ Position is open. It will close via a market order if price hits trigger %s.", stopMarketTriggerPriceStr) // Updated message
+	} else if marketOrderSuccess {
+		finalMsg += fmt.Sprintf("\n⚠️ Position is open, but protective stop-market order was not successfully placed. Manual monitoring may be required.") // Changed from stop-limit
+	}
+	sendMessage(chatId, finalMsg)
 }
 
 // Telegram message handler
@@ -1285,6 +1689,7 @@ func handleUpdates(tb *TradingBot) {
 					debugMsg := fmt.Sprintf("🔐 Debug Auth Info:\n"+
 						"API Key: %s\n"+
 						"Current Time: %d\n"+
+
 						"Expiry Time: %d\n"+
 						"Signature: %s\n"+
 						"Payload: GET/realtime%d",
@@ -1296,7 +1701,10 @@ func handleUpdates(tb *TradingBot) {
 					authMsg := buildAuthMessage(BYBIT_API_KEY, BYBIT_API_SECRET)
 					log.Printf("🔐 Re-sending auth message: %s", string(authMsg))
 
-					if err := tb.tradeConn.WriteMessage(websocket.TextMessage, authMsg); err != nil {
+					tb.tradeWriteMutex.Lock()
+					err := tb.tradeConn.WriteMessage(websocket.TextMessage, authMsg)
+					tb.tradeWriteMutex.Unlock()
+					if err != nil {
 						sendMessage(chatId, fmt.Sprintf("❌ Failed to re-authenticate: %v", err))
 					} else {
 						sendMessage(chatId, "🔄 Re-authentication sent, waiting for response...")
@@ -1331,14 +1739,17 @@ func main() {
 func (tb *TradingBot) SubscribeToSymbol(symbol string) error {
 	tickerMsg := buildSubscribeMessage(symbol)
 
-	if err := tb.publicConn.WriteMessage(websocket.TextMessage, tickerMsg); err != nil {
+	tb.publicWriteMutex.Lock()
+	err := tb.publicConn.WriteMessage(websocket.TextMessage, tickerMsg)
+	tb.publicWriteMutex.Unlock()
+	if err != nil {
 		return fmt.Errorf("failed to subscribe to ticker: %v", err)
 	}
 
 	// Wait for initial data - just a short wait for the first message
 	time.Sleep(500 * time.Millisecond)
 
-	// Check if price data exists
+	// Check immediately if price data exists
 	_, priceExists := tb.priceCache.Load(symbol)
 
 	if priceExists {
@@ -1361,6 +1772,7 @@ func (tb *TradingBot) updateFundingStrategy(strategy *FundingStrategy, info Fund
 		strategy.FundingRate = info.FundingRate
 
 		// Update target side based on new funding rate
+
 		targetSide := "Buy"
 		if info.FundingRate > 0 {
 			targetSide = "Sell" // Shorts get paid when rate is positive
@@ -1394,8 +1806,6 @@ func (tb *TradingBot) checkTradeConnection() error {
 	}
 	return nil
 }
-
-// Add these methods after the TradingBot struct definition
 
 // GetPrice returns the cached price for a symbol
 func (tb *TradingBot) GetPrice(symbol string) (float64, error) {
@@ -1465,34 +1875,34 @@ func (tb *TradingBot) setupFundingStrategy(chatId int64, symbol string, usdtAmou
 	sendMessage(chatId, msg)
 
 	// First run a test trade with the same parameters
-	sendMessage(chatId, "🧪 Running test trade before scheduling funding trade...")
+	sendMessage(chatId, "🧪 Running test trade (market open + protective stop-market close) before scheduling funding trade...")
 	testReq := TradeRequest{
 		Symbol:     symbol,
-		Side:       targetSide,
+		Side:       targetSide, // Use the same side as the funding strategy
 		UsdtAmount: usdtAmount,
 		Leverage:   leverage,
 		ChatId:     chatId,
 	}
 
-	// Execute test trade synchronously
+	// Execute test trade synchronously (it places orders and returns)
 	tb.ExecuteTestTrade(testReq)
 
-	// Wait a bit after test trade
-	time.Sleep(2 * time.Second)
+	// Wait a bit after test trade orders are placed
+	time.Sleep(3 * time.Second) // Increased slightly to allow messages to send
 
 	// If still enough time until funding, start the strategy
 	if time.Until(nextFunding) > 2*time.Minute {
-		sendMessage(chatId, "✅ Test trade completed. Starting funding strategy...")
+		sendMessage(chatId, "✅ Test trade orders placed. Starting funding strategy execution planning...")
 		go tb.executeFundingStrategy(strategy)
 	} else {
-		sendMessage(chatId, "❌ Too close to funding time after test. Will try next funding time.")
+		sendMessage(chatId, "❌ Too close to funding time after test. Will attempt strategy for the next funding interval.")
 	}
 }
 
 // buildOrderMessage creates an order message with proper timestamp handling
 func buildOrderMessage(reqId, symbol, side, qty string) []byte {
-	// Add a small buffer to account for network latency and clock drift
-	timestamp := strconv.FormatInt(time.Now().UnixMilli()+1000, 10) // Add 1 second buffer
+	// Use server-adjusted timestamp
+	timestamp := strconv.FormatInt(getServerAdjustedTimestamp(), 10)
 
 	orderJSON := fmt.Sprintf(`{"reqId":"%s","header":{"X-BAPI-TIMESTAMP":"%s","X-BAPI-RECV-WINDOW":"10000"},"op":"order.create","args":[{"symbol":"%s","side":"%s","orderType":"Market","qty":"%s","category":"linear","timeInForce":"IOC","reduceOnly":false}]}`,
 		reqId, timestamp, symbol, side, qty)
@@ -1502,8 +1912,8 @@ func buildOrderMessage(reqId, symbol, side, qty string) []byte {
 
 // buildCancelMessage creates a cancel order message with proper timestamp handling
 func buildCancelMessage(reqId, symbol, orderId string) []byte {
-	// Add a small buffer to account for network latency and clock drift
-	timestamp := strconv.FormatInt(time.Now().UnixMilli()+1000, 10) // Add 1 second buffer
+	// Use server-adjusted timestamp
+	timestamp := strconv.FormatInt(getServerAdjustedTimestamp(), 10)
 
 	cancelJSON := fmt.Sprintf(`{"reqId":"%s","header":{"X-BAPI-TIMESTAMP":"%s","X-BAPI-RECV-WINDOW":"10000"},"op":"order.cancel","args":[{"symbol":"%s","orderId":"%s","category":"linear"}]}`,
 		reqId, timestamp, symbol, orderId)
