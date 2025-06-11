@@ -318,33 +318,33 @@ func testSignatureWithDocExample() {
 }
 
 // Test both signature methods
-func testBothSignatureMethods() {
-	apiSecret := BYBIT_API_SECRET
-	testExpiry := int64(1711010121452)
+// func testBothSignatureMethods() {
+// 	apiSecret := BYBIT_API_SECRET
+// 	testExpiry := int64(1711010121452)
 
-	// Method 1: GET/realtime + timestamp
-	payload1 := fmt.Sprintf("GET/realtime%d", testExpiry)
-	h1 := hmac.New(sha256.New, []byte(apiSecret))
-	h1.Write([]byte(payload1))
-	sig1 := hex.EncodeToString(h1.Sum(nil))
-	log.Printf("🧪 Method 1 (GET/realtime): %s -> %s", payload1, sig1)
+// 	// Method 1: GET/realtime + timestamp
+// 	payload1 := fmt.Sprintf("GET/realtime%d", testExpiry)
+// 	h1 := hmac.New(sha256.New, []byte(apiSecret))
+// 	h1.Write([]byte(payload1))
+// 	sig1 := hex.EncodeToString(h1.Sum(nil))
+// 	log.Printf("🧪 Method 1 (GET/realtime): %s -> %s", payload1, sig1)
 
-	// Method 2: Just timestamp
-	payload2 := fmt.Sprintf("%d", testExpiry)
-	h2 := hmac.New(sha256.New, []byte(apiSecret))
-	h2.Write([]byte(payload2))
-	sig2 := hex.EncodeToString(h2.Sum(nil))
-	log.Printf("🧪 Method 2 (timestamp only): %s -> %s", payload2, sig2)
+// 	// Method 2: Just timestamp
+// 	payload2 := fmt.Sprintf("%d", testExpiry)
+// 	h2 := hmac.New(sha256.New, []byte(apiSecret))
+// 	h2.Write([]byte(payload2))
+// 	sig2 := hex.EncodeToString(h2.Sum(nil))
+// 	log.Printf("🧪 Method 2 (timestamp only): %s -> %s", payload2, sig2)
 
-	// Method 3: API key + timestamp
-	payload3 := fmt.Sprintf("%s%d", BYBIT_API_KEY, testExpiry)
-	h3 := hmac.New(sha256.New, []byte(apiSecret))
-	h3.Write([]byte(payload3))
-	sig3 := hex.EncodeToString(h3.Sum(nil))
-	log.Printf("🧪 Method 3 (key+timestamp): %s -> %s", payload3, sig3)
+// 	// Method 3: API key + timestamp
+// 	payload3 := fmt.Sprintf("%s%d", BYBIT_API_KEY, testExpiry)
+// 	h3 := hmac.New(sha256.New, []byte(apiSecret))
+// 	h3.Write([]byte(payload3))
+// 	sig3 := hex.EncodeToString(h3.Sum(nil))
+// 	log.Printf("🧪 Method 3 (key+timestamp): %s -> %s", payload3, sig3)
 
-	log.Printf("🧪 Expected from docs: ec71040eff72b163a36153d770b69d6637bcb29348fbfbb16c269a76595ececf")
-}
+// 	log.Printf("🧪 Expected from docs: ec71040eff72b163a36153d770b69d6637bcb29348fbfbb16c269a76595ececf")
+// }
 
 // Initialize trading bot
 func NewTradingBot() *TradingBot {
@@ -593,71 +593,102 @@ func (tb *TradingBot) handlePublicMessages() {
 	}
 }
 
+// Test both signature methods
+// func testBothSignatureMethods() {
+// 	apiSecret := BYBIT_API_SECRET
+// 	testExpiry := int64(1711010121452)
+
+// 	// Method 1: GET/realtime + timestamp
+// 	payload1 := fmt.Sprintf("GET/realtime%d", testExpiry)
+// 	h1 := hmac.New(sha256.New, []byte(apiSecret))
+// 	h1.Write([]byte(payload1))
+// 	sig1 := hex.EncodeToString(h1.Sum(nil))
+// 	log.Printf("🧪 Method 1 (GET/realtime): %s -> %s", payload1, sig1)
+
+// 	// Method 2: Just timestamp
+// 	payload2 := fmt.Sprintf("%d", testExpiry)
+// 	h2 := hmac.New(sha256.New, []byte(apiSecret))
+// 	h2.Write([]byte(payload2))
+// 	sig2 := hex.EncodeToString(h2.Sum(nil))
+// 	log.Printf("🧪 Method 2 (timestamp only): %s -> %s", payload2, sig2)
+
+// 	// Method 3: API key + timestamp
+// 	payload3 := fmt.Sprintf("%s%d", BYBIT_API_KEY, testExpiry)
+// 	h3 := hmac.New(sha256.New, []byte(apiSecret))
+// 	h3.Write([]byte(payload3))
+// 	sig3 := hex.EncodeToString(h3.Sum(nil))
+// 	log.Printf("🧪 Method 3 (key+timestamp): %s -> %s", payload3, sig3)
+
+// 	log.Printf("🧪 Expected from docs: ec71040eff72b163a36153d770b69d6637bcb29348fbfbb16c269a76595ececf")
+// }
+
 // Enhanced ticker parsing with fallback methods
-func (tb *TradingBot) parseTickerMessage(message []byte) {
-	var tickerData struct {
-		Topic string `json:"topic"`
-		Type  string `json:"type"`
-		Data  struct {
-			Symbol          string `json:"symbol"`
-			LastPrice       string `json:"lastPrice"`
-			NextFundingTime string `json:"nextFundingTime"`
-			FundingRate     string `json:"fundingRate"`
-			MarkPrice       string `json:"markPrice"`
-		} `json:"data"`
-	}
+// func (tb *TradingBot) parseTickerMessage(message []byte) {
+// 	var tickerData struct {
+// 		Topic string `json:"topic"`
+// 		Type  string `json:"type"`
+// 		Data  struct {
+// 			Symbol          string `json:"symbol"`
+// 			LastPrice       string `json:"lastPrice"`
+// 			NextFundingTime string `json:"nextFundingTime"`
+// 			FundingRate     string `json:"fundingRate"`
+// 			MarkPrice       string `json:"markPrice"`
+// 		} `json:"data"`
+// 	}
 
-	if err := json.Unmarshal(message, &tickerData); err == nil && tickerData.Data.Symbol != "" {
-		symbol := tickerData.Data.Symbol
+// 	if err := json.Unmarshal(message, &tickerData); err == nil && tickerData.Data.Symbol != "" {
+// 		symbol := tickerData.Data.Symbol
 
-		// Always try to parse and store price first
-		if price, err := strconv.ParseFloat(tickerData.Data.LastPrice, 64); err == nil && price > 0 {
-			tb.priceCache.Store(symbol, price)
-			log.Printf("💰 Price updated: %s = %.8f", symbol, price)
-		}
+// 		// Always try to parse and store price first
+// 		if price, err := strconv.ParseFloat(tickerData.Data.LastPrice, 64); err == nil && price > 0 {
+// 			tb.priceCache.Store(symbol, price)
+// 			log.Printf("💰 Price updated: %s = %.8f", symbol, price)
+// 		}
 
-		// Then parse funding data if available
-		if tickerData.Data.FundingRate != "" && tickerData.Data.NextFundingTime != "" {
-			rate, err := strconv.ParseFloat(tickerData.Data.FundingRate, 64)
-			if err == nil {
-				fundingTimeMs, err := strconv.ParseInt(tickerData.Data.NextFundingTime, 10, 64)
-				if err == nil {
-					nextTime := time.Unix(fundingTimeMs/1000, 0)
+// 		// Then parse funding data if available
+// 		if tickerData.Data.FundingRate != "" && tickerData.Data.NextFundingTime != "" {
+// 			rate, err := strconv.ParseFloat(tickerData.Data.FundingRate, 64)
+// 			if err == nil {
+// 				fundingTimeMs, err := strconv.ParseInt(tickerData.Data.NextFundingTime, 10, 64)
+// 				if err == nil {
+// 					nextTime := time.Unix(fundingTimeMs/1000, 0)
 
-					info := FundingInfo{
-						Symbol:           symbol,
-						FundingRate:      rate,
-						NextFundingTime:  nextTime.Format("2006-01-02T15:04:05Z"),
-						FundingTimestamp: nextTime.Unix(),
-					}
+// 					info := FundingInfo{
+// 						Symbol:           symbol,
+// 						FundingRate:      rate,
+// 						NextFundingTime:  nextTime.Format("2006-01-02T15:04:05Z"),
+// 						FundingTimestamp: nextTime.Unix(),
 
-					tb.fundingCache.Store(symbol, info)
-					log.Printf("💰 Updated funding for %s: Rate=%.6f%%, Next=%s",
-						symbol, rate*100, nextTime.Format("15:04:05 MST"))
-				}
-			}
-		}
-		return // Successfully parsed main format
-	}
+// 						// Removed executionLimitPrice and executionLimitPriceStr calculation
+// 					}
 
-	// Only try fallbacks if main parsing failed
-	log.Printf("📡 Using fallback parser for: %s", string(message))
+// 					tb.fundingCache.Store(symbol, info)
+// 					log.Printf("💰 Updated funding for %s: Rate=%.6f%%, Next=%s",
+// 						symbol, rate*100, nextTime.Format("15:04:05 MST"))
+// 				}
+// 			}
+// 		}
+// 		return // Successfully parsed main format
+// 	}
 
-	// Try simpler format
-	var simpleData struct {
-		Topic string `json:"topic"`
-		Data  struct {
-			Symbol    string `json:"symbol"`
-			LastPrice string `json:"lastPrice"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(message, &simpleData); err == nil && simpleData.Data.Symbol != "" {
-		if price, err := strconv.ParseFloat(simpleData.Data.LastPrice, 64); err == nil && price > 0 {
-			tb.priceCache.Store(simpleData.Data.Symbol, price)
-			log.Printf("💰 Price updated (simple): %s = %.8f", simpleData.Data.Symbol, price)
-		}
-	}
-}
+// 	// Only try fallbacks if main parsing failed
+// 	log.Printf("📡 Using fallback parser for: %s", string(message))
+
+// 	// Try simpler format
+// 	var simpleData struct {
+// 		Topic string `json:"topic"`
+// 		Data  struct {
+// 			Symbol    string `json:"symbol"`
+// 			LastPrice string `json:"lastPrice"`
+// 		} `json:"data"`
+// 	}
+// 	if err := json.Unmarshal(message, &simpleData); err == nil && simpleData.Data.Symbol != "" {
+// 		if price, err := strconv.ParseFloat(simpleData.Data.LastPrice, 64); err == nil && price > 0 {
+// 			tb.priceCache.Store(simpleData.Data.Symbol, price)
+// 			log.Printf("💰 Price updated (simple): %s = %.8f", simpleData.Data.Symbol, price)
+// 		}
+// 	}
+// }
 
 // Remove unused variables and functions to clean up warnings
 // Remove these unused variables:
@@ -713,7 +744,7 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
-func (tb *TradingBot) ultraFastClose(chatId int64, symbol, orderId string,
+func (tb *TradingBot) ultraFastClose(chatId int64, symbol string,
 	cancelReqId, closeReqId string, cancelMsg, closeMsg []byte,
 	startTime time.Time, actualDelay time.Duration) {
 
@@ -896,7 +927,7 @@ func (tb *TradingBot) ExecuteTrade(req TradeRequest) {
 			actualDelay := closeStartTime.Sub(orderOpenTime)
 
 			// Ultra-fast close execution
-			tb.ultraFastClose(req.ChatId, req.Symbol, orderId, cancelReqId, closeReqId,
+			tb.ultraFastClose(req.ChatId, req.Symbol, cancelReqId, closeReqId,
 				cancelMsg, closeMsg, closeStartTime, actualDelay)
 		}()
 
@@ -1106,10 +1137,9 @@ func buildStopMarketOrderMessage(reqId, symbol, side, qty, triggerPrice string, 
 }
 
 // Helper function to format price with proper precision
-func formatPrice(price float64, symbol string) string {
+func formatPrice(price float64) string {
 	// Most crypto pairs need different decimal places
 	// For simplicity, using a tiered approach based on price magnitude.
-	// The 'symbol' parameter is available for future enhancement (e.g., using tick size).
 	if price >= 1000 {
 		return fmt.Sprintf("%.2f", price) // e.g., 60000.12
 	} else if price >= 100 {
@@ -1177,7 +1207,7 @@ func (tb *TradingBot) executeFundingStrategy(strategy *FundingStrategy) {
 
 	// Calculate limit order price (0.3% below current price)
 	limitPrice := currentPrice * (1 - LIMIT_ORDER_OFFSET)
-	limitPriceStr := formatPrice(limitPrice, strategy.Symbol)
+	limitPriceStr := formatPrice(limitPrice)
 
 	// Determine opposite side for limit order
 	oppositeSide := "Sell"
@@ -1185,7 +1215,7 @@ func (tb *TradingBot) executeFundingStrategy(strategy *FundingStrategy) {
 		oppositeSide = "Buy"
 		// For short positions, limit order should be 0.3% above to close
 		limitPrice = currentPrice * (1 + LIMIT_ORDER_OFFSET)
-		limitPriceStr = formatPrice(limitPrice, strategy.Symbol)
+		limitPriceStr = formatPrice(limitPrice)
 	}
 
 	sendMessage(strategy.ChatId, fmt.Sprintf("🎯 OPENING FUNDING POSITION!\n"+
@@ -1270,18 +1300,19 @@ func (tb *TradingBot) ExecuteTestTrade(req TradeRequest) {
 		// Protective Buy Stop-Market is triggered ABOVE current price
 		stopMarketTriggerPrice = currentPrice * (1 + LIMIT_ORDER_OFFSET)
 	}
-	stopMarketTriggerPriceStr := formatPrice(stopMarketTriggerPrice, req.Symbol) // Renamed from limitPriceStr
+	stopMarketTriggerPriceStr := formatPrice(stopMarketTriggerPrice) // Renamed from limitPriceStr
 
 	log.Printf("🧪 Test Trade Details: Symbol=%s, OpenSide=%s, Qty=%s, EntryPrice=%.8f, CloseSide=%s, ProtectiveStopMarketTrigger=%s",
 		req.Symbol, openSide, qtyStr, currentPrice, closeSide, stopMarketTriggerPriceStr)
 
-	tb.executeMarketOpenWithProtectiveStopMarketClose(req.ChatId, req.Symbol, openSide, qtyStr, closeSide, stopMarketTriggerPriceStr, currentPrice, req.Leverage, req.UsdtAmount)
+	tb.executeMarketOpenWithProtectiveStopMarketClose(req.ChatId, req.Symbol, openSide, qtyStr, closeSide, stopMarketTriggerPriceStr, req.Leverage, req.UsdtAmount)
 }
 
 // executeMarketOpenWithProtectiveStopMarketClose sends a market open order and a reduce-only stop-market close order.
-func (tb *TradingBot) executeMarketOpenWithProtectiveStopMarketClose(chatId int64, symbol, marketSide, qty, stopMarketSide, stopMarketTriggerPriceStr string, entryPrice, leverage, usdtAmount float64) {
+func (tb *TradingBot) executeMarketOpenWithProtectiveStopMarketClose(chatId int64, symbol, marketSide, qty, stopMarketSide, stopMarketTriggerPriceStr string, leverage, usdtAmount float64) {
+	orderStartTime := time.Now()
 	marketReqId := generateReqId()
-	stopMarketReqId := generateReqId() // Renamed from stopLimitReqId
+	stopMarketReqId := generateReqId()
 
 	marketOrderMsg := buildOrderMessage(marketReqId, symbol, marketSide, qty)
 	log.Printf("🧪 Protective Trade: Market Order Msg (reqId: %s): %s", marketReqId, string(marketOrderMsg))
@@ -1329,8 +1360,11 @@ func (tb *TradingBot) executeMarketOpenWithProtectiveStopMarketClose(chatId int6
 			if marketResp.RetCode == 0 {
 				marketOrderSuccess = true
 				marketOrderId = marketResp.Data.OrderId
-				marketOrderMsgStr = fmt.Sprintf("✅ Market %s Order [%s] placed.", marketSide, marketOrderId)
-				log.Printf("✅ Protective Trade: Market order %s successful: %s (reqId: %s)", marketSide, marketOrderId, marketReqId)
+				marketDuration := time.Since(orderStartTime)
+				marketOrderMsgStr = fmt.Sprintf("✅ Market %s Order [%s] placed (%.2f ms).",
+					marketSide, marketOrderId, float64(marketDuration.Nanoseconds())/1000000.0)
+				log.Printf("✅ Protective Trade: Market order %s successful: %s (reqId: %s) in %.2f ms",
+					marketSide, marketOrderId, marketReqId, float64(marketDuration.Nanoseconds())/1000000.0)
 			} else {
 				marketOrderMsgStr = fmt.Sprintf("❌ Market %s Order Failed: %s (Code: %d)", marketSide, marketResp.RetMsg, marketResp.RetCode)
 				log.Printf("❌ Protective Trade: Market order %s failed: %s (Code: %d, reqId: %s)", marketSide, marketResp.RetMsg, marketResp.RetCode, marketReqId)
@@ -1343,6 +1377,8 @@ func (tb *TradingBot) executeMarketOpenWithProtectiveStopMarketClose(chatId int6
 
 	// If market order was successful, proceed to send the stop-market order
 	if marketOrderSuccess {
+		stopLossStartTime := time.Now()
+
 		var triggerDirection int
 
 		if stopMarketSide == "Sell" { // Protecting a long position, so stop-market is a Sell order
@@ -1382,8 +1418,13 @@ func (tb *TradingBot) executeMarketOpenWithProtectiveStopMarketClose(chatId int6
 				log.Printf("🧪 Protective Trade: Received stop-market order response (reqId: %s): %+v", stopMarketReqId, stopMarketResp)
 				if stopMarketResp.RetCode == 0 {
 					stopMarketOrderId = stopMarketResp.Data.OrderId
-					stopMarketOrderMsgStr = fmt.Sprintf("✅ Protective Stop-Market %s Order [%s] placed. Trigger: %s.", stopMarketSide, stopMarketOrderId, stopMarketTriggerPriceStr)              // Removed Limit price
-					log.Printf("✅ Protective Trade: Stop-Market order %s successful: %s (reqId: %s). Trigger: %s", stopMarketSide, stopMarketOrderId, stopMarketReqId, stopMarketTriggerPriceStr) // Removed Limit price
+					stopLossDuration := time.Since(stopLossStartTime)
+					totalDuration := time.Since(orderStartTime)
+					stopMarketOrderMsgStr = fmt.Sprintf("✅ Protective Stop-Market %s Order [%s] placed (%.2f ms). Trigger: %s.",
+						stopMarketSide, stopMarketOrderId, float64(stopLossDuration.Nanoseconds())/1000000.0, stopMarketTriggerPriceStr)
+					log.Printf("✅ Protective Trade: Stop-Market order %s successful: %s (reqId: %s) in %.2f ms. Total setup time: %.2f ms",
+						stopMarketSide, stopMarketOrderId, stopMarketReqId, float64(stopLossDuration.Nanoseconds())/1000000.0,
+						float64(totalDuration.Nanoseconds())/1000000.0)
 				} else {
 					stopMarketOrderMsgStr = fmt.Sprintf("❌ Protective Stop-Market %s Order Failed: %s (Code: %d)", stopMarketSide, stopMarketResp.RetMsg, stopMarketResp.RetCode)
 					log.Printf("❌ Protective Trade: Stop-Market order %s failed: %s (Code: %d, reqId: %s)", stopMarketSide, stopMarketResp.RetMsg, stopMarketResp.RetCode, stopMarketReqId)
@@ -1400,8 +1441,10 @@ func (tb *TradingBot) executeMarketOpenWithProtectiveStopMarketClose(chatId int6
 		stopMarketOrderMsgStr = "ℹ️ Protective stop-market order not attempted due to market order failure." // Changed from stop-limit
 	}
 
-	finalMsg := fmt.Sprintf("🧪 TEST TRADE RESULT for %s %.2f USDT %.0fx:\n%s\n%s",
-		symbol, usdtAmount, leverage, marketOrderMsgStr, stopMarketOrderMsgStr)
+	finalMsg := fmt.Sprintf("🧪 TEST TRADE RESULT for %s %.2f USDT %.0fx:\n%s\n%s\nTotal setup time: %.2f ms",
+		symbol, usdtAmount, leverage, marketOrderMsgStr, stopMarketOrderMsgStr,
+		float64(time.Since(orderStartTime).Nanoseconds())/1000000.0)
+
 	if marketOrderSuccess && stopMarketOrderId != "" {
 		// Removed parsing of executionLimitPriceForMsg as it's not relevant for stop-market
 
@@ -1686,14 +1729,12 @@ func handleUpdates(tb *TradingBot) {
 					expiryTimestamp := timestamp + 10000
 					signature := generateSignature(BYBIT_API_SECRET, expiryTimestamp)
 
-					debugMsg := fmt.Sprintf("🔐 Debug Auth Info:\n"+
-						"API Key: %s\n"+
-						"Current Time: %d\n"+
-
-						"Expiry Time: %d\n"+
-						"Signature: %s\n"+
-						"Payload: GET/realtime%d",
-						BYBIT_API_KEY, timestamp, expiryTimestamp, signature, expiryTimestamp)
+					debugMsg := "🔐 Debug Auth Info:\n" +
+						"API Key: " + BYBIT_API_KEY + "\n" +
+						"Current Time: " + strconv.FormatInt(timestamp, 10) + "\n" +
+						"Expiry Time: " + strconv.FormatInt(expiryTimestamp, 10) + "\n" +
+						"Signature: " + signature + "\n" +
+						"Payload: GET/realtime" + strconv.FormatInt(expiryTimestamp, 10)
 
 					sendMessage(chatId, debugMsg)
 
@@ -1817,7 +1858,7 @@ func (tb *TradingBot) GetPrice(symbol string) (float64, error) {
 
 // immediateClose attempts to close a position as fast as possible
 func (tb *TradingBot) immediateClose(chatId int64, symbol, orderId, side, qty string,
-	startTime, openTime time.Time, tradeType string) {
+	startTime, openTime time.Time) {
 
 	// Create request IDs
 	cancelReqId := generateReqId()
@@ -1828,7 +1869,7 @@ func (tb *TradingBot) immediateClose(chatId int64, symbol, orderId, side, qty st
 	closeMsg := buildOrderMessage(closeReqId, symbol, side, qty)
 
 	// Execute ultra-fast close
-	tb.ultraFastClose(chatId, symbol, orderId, cancelReqId, closeReqId,
+	tb.ultraFastClose(chatId, symbol, cancelReqId, closeReqId,
 		cancelMsg, closeMsg, startTime, time.Since(openTime))
 }
 
