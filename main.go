@@ -1930,14 +1930,6 @@ func (tb *TradingBot) setupFundingStrategy(chatId int64, symbol string, usdtAmou
 
 	// Wait a bit after test trade orders are placed
 	time.Sleep(3 * time.Second) // Increased slightly to allow messages to send
-
-	// If still enough time until funding, start the strategy
-	if time.Until(nextFunding) > 2*time.Minute {
-		sendMessage(chatId, "✅ Test trade orders placed. Starting funding strategy execution planning...")
-		go tb.executeFundingStrategy(strategy)
-	} else {
-		sendMessage(chatId, "❌ Too close to funding time after test. Will attempt strategy for the next funding interval.")
-	}
 }
 
 // buildOrderMessage creates an order message with proper timestamp handling
