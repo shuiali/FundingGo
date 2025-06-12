@@ -1446,13 +1446,154 @@ func (tb *TradingBot) executeMarketOpenWithProtectiveStopMarketClose(chatId int6
 		float64(time.Since(orderStartTime).Nanoseconds())/1000000.0)
 
 	if marketOrderSuccess && stopMarketOrderId != "" {
-		// Removed parsing of executionLimitPriceForMsg as it's not relevant for stop-market
-
 		finalMsg += fmt.Sprintf("\nℹ️ Position is open. It will close via a market order if price hits trigger %s.", stopMarketTriggerPriceStr) // Updated message
+		finalMsg += "\n⏰ Both orders will be automatically closed in exactly 5 seconds..."
+		// Schedule automatic closure after exactly 5 seconds
+		go tb.autoCloseTestTrade(chatId, symbol, marketOrderId, stopMarketOrderId, marketSide, qty, orderStartTime)
 	} else if marketOrderSuccess {
-		finalMsg += fmt.Sprintf("\n⚠️ Position is open, but protective stop-market order was not successfully placed. Manual monitoring may be required.") // Changed from stop-limit
+		finalMsg += "\n⚠️ Position is open, but protective stop-market order was not successfully placed. Manual monitoring may be required." // Changed from stop-limit
+		finalMsg += "\n⏰ Market order will be automatically closed in exactly 5 seconds..."
+		// Schedule automatic closure of just the market order
+		go tb.autoCloseTestTrade(chatId, symbol, marketOrderId, "", marketSide, qty, orderStartTime)
 	}
 	sendMessage(chatId, finalMsg)
+}
+
+// autoCloseTestTrade automatically closes test trade orders after exactly 5 seconds
+func (tb *TradingBot) autoCloseTestTrade(chatId int64, symbol, marketOrderId, stopMarketOrderId, marketSide, qty string, orderStartTime time.Time) {
+	targetCloseTime := orderStartTime.Add(AUTO_CLOSE_DELAY)
+	timer := time.NewTimer(time.Until(targetCloseTime))
+	<-timer.C
+
+	closeInitiationTime := time.Now()
+	actualDelay := closeInitiationTime.Sub(orderStartTime)
+
+	log.Printf("🧪 Auto-closing test trade for %s. Market Order ID: %s, Stop Order ID: %s. Actual delay: %.2f ms",
+		symbol, marketOrderId, stopMarketOrderId, float64(actualDelay.Nanoseconds())/1000000.0)
+
+	var wg sync.WaitGroup
+	var cancelStopSuccess, closeMarketSuccess bool
+	var cancelDuration, closeDuration time.Duration
+	var cancelMsgStr, closeMsgStr string
+
+	// Determine opposite side for closing the market position
+	oppositeSide := "Sell"
+	if marketSide == "Sell" {
+		oppositeSide = "Buy"
+	}
+
+	// Attempt to cancel the stop-market order if it exists
+	if stopMarketOrderId != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cancelStartTime := time.Now()
+			cancelReqId := generateReqId()
+			cancelOrderMsg := buildCancelMessage(cancelReqId, symbol, stopMarketOrderId)
+
+			cancelRespChan := make(chan CancelResponse, 1)
+			tb.responses.Store(cancelReqId, cancelRespChan)
+			defer tb.responses.Delete(cancelReqId)
+
+			log.Printf("🧪 Auto-close: Attempting to cancel stop-market order %s (reqId: %s)", stopMarketOrderId, cancelReqId)
+			tb.tradeWriteMutex.Lock()
+			err := tb.tradeConn.WriteMessage(websocket.TextMessage, cancelOrderMsg)
+			tb.tradeWriteMutex.Unlock()
+
+			if err != nil {
+				log.Printf("❌ Auto-close: Failed to send cancel for stop-market order %s: %v", stopMarketOrderId, err)
+				cancelMsgStr = fmt.Sprintf("🚫 Stop-Market Cancel [%s]: Send Error", stopMarketOrderId)
+				return
+			}
+
+			select {
+			case resp := <-cancelRespChan:
+				cancelDuration = time.Since(cancelStartTime)
+				if resp.RetCode == 0 {
+					cancelStopSuccess = true
+					log.Printf("✅ Auto-close: Successfully cancelled stop-market order %s in %.2f ms", stopMarketOrderId, float64(cancelDuration.Nanoseconds())/1000000.0)
+					cancelMsgStr = fmt.Sprintf("🚫 Stop-Market Cancelled [%s] (%.2f ms)", stopMarketOrderId, float64(cancelDuration.Nanoseconds())/1000000.0)
+				} else {
+					log.Printf("❌ Auto-close: Failed to cancel stop-market order %s: %s (Code: %d)", stopMarketOrderId, resp.RetMsg, resp.RetCode)
+					cancelMsgStr = fmt.Sprintf("🚫 Stop-Market Cancel FAILED [%s]: %s", stopMarketOrderId, resp.RetMsg)
+				}
+			case <-time.After(ORDER_TIMEOUT):
+				cancelDuration = time.Since(cancelStartTime)
+				log.Printf("❌ Auto-close: Timeout cancelling stop-market order %s (%.2f ms)", stopMarketOrderId, float64(cancelDuration.Nanoseconds())/1000000.0)
+				cancelMsgStr = fmt.Sprintf("🚫 Stop-Market Cancel TIMEOUT [%s]", stopMarketOrderId)
+			}
+		}()
+	} else {
+		cancelMsgStr = "🚫 No Stop-Market order to cancel."
+	}
+
+	// Attempt to close the market position
+	if marketOrderId != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			closeMarketStartTime := time.Now()
+			closeReqId := generateReqId()
+			// Ensure reduceOnly is true for closing orders if applicable, though market close usually just reverses.
+			// For simplicity, using the standard buildOrderMessage which is not reduceOnly by default for market.
+			// If this needs to be strictly reduceOnly, buildOrderMessage might need a reduceOnly flag.
+			// However, closing with opposite side and same quantity should effectively close the position.
+			closeOrderMsg := buildOrderMessage(closeReqId, symbol, oppositeSide, qty) // This uses IOC by default
+
+			closeRespChan := make(chan OrderResponse, 1)
+			tb.responses.Store(closeReqId, closeRespChan)
+			defer tb.responses.Delete(closeReqId)
+
+			log.Printf("🧪 Auto-close: Attempting to close market position (Order ID: %s) with %s %s (reqId: %s)", marketOrderId, oppositeSide, qty, closeReqId)
+			tb.tradeWriteMutex.Lock()
+			err := tb.tradeConn.WriteMessage(websocket.TextMessage, closeOrderMsg)
+			tb.tradeWriteMutex.Unlock()
+
+			if err != nil {
+				log.Printf("❌ Auto-close: Failed to send close order for market position %s: %v", marketOrderId, err)
+				closeMsgStr = fmt.Sprintf("🔄 Position Close (was %s): Send Error", marketOrderId)
+				return
+			}
+
+			select {
+			case resp := <-closeRespChan:
+				closeDuration = time.Since(closeMarketStartTime)
+				if resp.RetCode == 0 {
+					closeMarketSuccess = true
+					log.Printf("✅ Auto-close: Successfully closed market position (original ID %s, new close ID %s) in %.2f ms", marketOrderId, resp.Data.OrderId, float64(closeDuration.Nanoseconds())/1000000.0)
+					closeMsgStr = fmt.Sprintf("🔄 Position Closed (was %s, new ID %s) (%.2f ms)", marketOrderId, resp.Data.OrderId, float64(closeDuration.Nanoseconds())/1000000.0)
+				} else {
+					log.Printf("❌ Auto-close: Failed to close market position %s: %s (Code: %d)", marketOrderId, resp.RetMsg, resp.RetCode)
+					closeMsgStr = fmt.Sprintf("🔄 Position Close FAILED (was %s): %s", marketOrderId, resp.RetMsg)
+				}
+			case <-time.After(ORDER_TIMEOUT):
+				closeDuration = time.Since(closeMarketStartTime)
+				log.Printf("❌ Auto-close: Timeout closing market position %s (%.2f ms)", marketOrderId, float64(closeDuration.Nanoseconds())/1000000.0)
+				closeMsgStr = fmt.Sprintf("🔄 Position Close TIMEOUT (was %s)", marketOrderId)
+			}
+		}()
+	} else {
+		closeMsgStr = "🔄 No Market order to close." // Should not happen if autoCloseTestTrade is called
+	}
+
+	wg.Wait()
+
+	totalAutoCloseDuration := time.Since(closeInitiationTime)
+	finalReportMsg := fmt.Sprintf("💥 TEST TRADE AUTO-CLOSED for %s!\n"+
+		"⏰ Opened for: %.0f ms (target: %d ms)\n%s\n%s\n"+
+		"⚡ Total Auto-Close Ops Time: %.2f ms",
+		symbol,
+		float64(actualDelay.Nanoseconds())/1000000.0,
+		AUTO_CLOSE_DELAY/time.Millisecond,
+		cancelMsgStr,
+		closeMsgStr,
+		float64(totalAutoCloseDuration.Nanoseconds())/1000000.0)
+
+	if (stopMarketOrderId != "" && !cancelStopSuccess) || (marketOrderId != "" && !closeMarketSuccess) {
+		finalReportMsg = "⚠️ Some auto-close operations failed. Check logs.\n" + finalReportMsg
+	}
+
+	sendMessage(chatId, finalReportMsg)
 }
 
 // Telegram message handler
@@ -1917,6 +2058,7 @@ func (tb *TradingBot) setupFundingStrategy(chatId int64, symbol string, usdtAmou
 
 	// First run a test trade with the same parameters
 	sendMessage(chatId, "🧪 Running test trade (market open + protective stop-market close) before scheduling funding trade...")
+	sendMessage(chatId, "⏰ Test orders will auto-close after exactly 5 seconds...") // Inform user about auto-closure
 	testReq := TradeRequest{
 		Symbol:     symbol,
 		Side:       targetSide, // Use the same side as the funding strategy
@@ -1925,11 +2067,26 @@ func (tb *TradingBot) setupFundingStrategy(chatId int64, symbol string, usdtAmou
 		ChatId:     chatId,
 	}
 
-	// Execute test trade synchronously (it places orders and returns)
+	// Execute test trade synchronously (it places orders and returns, auto-close is a goroutine)
 	tb.ExecuteTestTrade(testReq)
 
-	// Wait a bit after test trade orders are placed
-	time.Sleep(3 * time.Second) // Increased slightly to allow messages to send
+	// Wait a bit after test trade orders are placed and initial messages sent.
+	// The auto-close will happen in parallel.
+	// This sleep is to allow the user to see the test trade messages before funding strategy planning message.
+	// Increased to 6 seconds to ensure auto-close message for test trade likely appears before next message.
+	time.Sleep(6 * time.Second)
+
+	// If still enough time until funding, start the strategy
+	// Check current time against nextFunding, as the test trade might take some time.
+	if time.Until(strategy.NextFunding) > 2*time.Minute { // Use strategy.NextFunding for the check
+		sendMessage(chatId, "✅ Test trade sequence complete. Starting funding strategy execution planning...")
+		go tb.executeFundingStrategy(strategy)
+	} else {
+		sendMessage(chatId, fmt.Sprintf("❌ Too close to funding time (next at %s, %s left) after test. Will attempt strategy for the next funding interval.",
+			strategy.NextFunding.Format("15:04:05 MST"), formatDuration(time.Until(strategy.NextFunding))))
+		// Optionally, remove the strategy if it's too late for this cycle
+		// tb.strategies.Delete(symbol)
+	}
 }
 
 // buildOrderMessage creates an order message with proper timestamp handling
