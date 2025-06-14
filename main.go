@@ -33,7 +33,7 @@ const (
 	// Updated funding constants
 	FUNDING_OPEN_DELAY  = 500 * time.Millisecond // Exactly 500ms before funding
 	FUNDING_CLOSE_DELAY = 100 * time.Millisecond // 100ms after funding
-	LIMIT_ORDER_OFFSET  = 0.0015                  // 0.3% below/above opening price for limit orders
+	LIMIT_ORDER_OFFSET  = 0.003                  // 0.3% below/above opening price for limit orders
 
 	FUNDING_TOPIC_PREFIX = "funding."
 )
@@ -2075,11 +2075,6 @@ func (tb *TradingBot) setupFundingStrategy(chatId int64, symbol string, usdtAmou
 	// This sleep is to allow the user to see the test trade messages before funding strategy planning message.
 	// Increased to 6 seconds to ensure auto-close message for test trade likely appears before next message.
 	time.Sleep(6 * time.Second)
-
-	// If still enough time until funding, start the strategy
-		// Optionally, remove the strategy if it's too late for this cycle
-		// tb.strategies.Delete(symbol)
-	}
 }
 
 // buildOrderMessage creates an order message with proper timestamp handling
