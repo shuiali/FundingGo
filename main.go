@@ -2077,13 +2077,6 @@ func (tb *TradingBot) setupFundingStrategy(chatId int64, symbol string, usdtAmou
 	time.Sleep(6 * time.Second)
 
 	// If still enough time until funding, start the strategy
-	// Check current time against nextFunding, as the test trade might take some time.
-	if time.Until(strategy.NextFunding) > 2*time.Minute { // Use strategy.NextFunding for the check
-		sendMessage(chatId, "✅ Test trade sequence complete. Starting funding strategy execution planning...")
-		go tb.executeFundingStrategy(strategy)
-	} else {
-		sendMessage(chatId, fmt.Sprintf("❌ Too close to funding time (next at %s, %s left) after test. Will attempt strategy for the next funding interval.",
-			strategy.NextFunding.Format("15:04:05 MST"), formatDuration(time.Until(strategy.NextFunding))))
 		// Optionally, remove the strategy if it's too late for this cycle
 		// tb.strategies.Delete(symbol)
 	}
