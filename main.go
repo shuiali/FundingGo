@@ -31,7 +31,7 @@ const (
 	ORDER_TIMEOUT       = 3 * time.Second
 
 	// Updated funding constants
-	FUNDING_OPEN_DELAY  = 500 * time.Millisecond // Exactly 500ms before funding
+	FUNDING_OPEN_DELAY  = 100 * time.Millisecond // Exactly 500ms before funding
 	FUNDING_CLOSE_DELAY = 100 * time.Millisecond // 100ms after funding
 	LIMIT_ORDER_OFFSET  = 0.003                  // 0.3% below/above opening price for limit orders
 
