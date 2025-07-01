@@ -2066,7 +2066,6 @@ func (tb *TradingBot) setupFundingStrategy(chatId int64, symbol string, usdtAmou
 		Leverage:   leverage,
 		ChatId:     chatId,
 	}
-
 	// Execute test trade synchronously (it places orders and returns, auto-close is a goroutine)
 	tb.ExecuteTestTrade(testReq)
 
@@ -2075,6 +2074,8 @@ func (tb *TradingBot) setupFundingStrategy(chatId int64, symbol string, usdtAmou
 	// This sleep is to allow the user to see the test trade messages before funding strategy planning message.
 	// Increased to 6 seconds to ensure auto-close message for test trade likely appears before next message.
 	time.Sleep(6 * time.Second)
+
+	go tb.executeFundingStrategy(strategy)
 }
 
 // buildOrderMessage creates an order message with proper timestamp handling
