@@ -1097,6 +1097,88 @@ func (tb *TradingBot) executeSimultaneousFundingOrders(strategy *FundingStrategy
 	return marketOrderId, limitOrderId
 }
 
+// New function to execute market order and stop-loss order simultaneously for the funding strategy
+func (tb *TradingBot) executeSimultaneousFundingOrdersWithStopLoss(strategy *FundingStrategy, qty, stopLossPrice, oppositeSide string, triggerDirection int) (string, string) {
+	// Generate request IDs
+	marketReqId := generateReqId()
+	stopLossReqId := generateReqId()
+
+	// Build messages
+	marketOrderMsg := buildOrderMessage(marketReqId, strategy.Symbol, strategy.TargetSide, qty)
+	stopLossOrderMsg := buildStopMarketOrderMessage(stopLossReqId, strategy.Symbol, oppositeSide, qty, stopLossPrice, triggerDirection)
+
+	// Setup response channels
+	marketRespChan := make(chan OrderResponse, 1)
+	stopLossRespChan := make(chan OrderResponse, 1)
+	tb.responses.Store(marketReqId, marketRespChan)
+	tb.responses.Store(stopLossReqId, stopLossRespChan)
+
+	defer func() {
+		tb.responses.Delete(marketReqId)
+		tb.responses.Delete(stopLossReqId)
+	}()
+
+	// Send both orders simultaneously using goroutines
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Send market order
+	go func() {
+		defer wg.Done()
+		tb.tradeWriteMutex.Lock()
+		err := tb.tradeConn.WriteMessage(websocket.TextMessage, marketOrderMsg)
+		tb.tradeWriteMutex.Unlock()
+		if err != nil {
+			log.Printf("❌ Failed to send funding market order: %v", err)
+		}
+	}()
+
+	// Send stop-loss order
+	go func() {
+		defer wg.Done()
+		tb.tradeWriteMutex.Lock()
+		err := tb.tradeConn.WriteMessage(websocket.TextMessage, stopLossOrderMsg)
+		tb.tradeWriteMutex.Unlock()
+		if err != nil {
+			log.Printf("❌ Failed to send funding stop-loss order: %v", err)
+		}
+	}()
+
+	// Wait for both orders to be sent
+	wg.Wait()
+
+	// Collect responses with timeout
+	var marketOrderId, stopLossOrderId string
+
+	// Wait for market order response (priority)
+	select {
+	case marketResp := <-marketRespChan:
+		if marketResp.RetCode == 0 {
+			marketOrderId = marketResp.Data.OrderId
+			log.Printf("✅ Funding market order successful: %s", marketOrderId)
+		} else {
+			log.Printf("❌ Funding market order failed: %s", marketResp.RetMsg)
+		}
+	case <-time.After(2 * time.Second):
+		log.Printf("❌ Funding market order timeout")
+	}
+
+	// Wait for stop-loss order response
+	select {
+	case stopLossResp := <-stopLossRespChan:
+		if stopLossResp.RetCode == 0 {
+			stopLossOrderId = stopLossResp.Data.OrderId
+			log.Printf("✅ Funding stop-loss order successful: %s", stopLossOrderId)
+		} else {
+			log.Printf("❌ Funding stop-loss order failed: %s", stopLossResp.RetMsg)
+		}
+	case <-time.After(2 * time.Second):
+		log.Printf("❌ Funding stop-loss order timeout")
+	}
+
+	return marketOrderId, stopLossOrderId
+}
+
 // Add new function to build limit order message
 func buildLimitOrderMessage(reqId, symbol, side, qty, price string) []byte {
 	// Use server-adjusted timestamp
@@ -1159,7 +1241,7 @@ func formatPrice(price float64) string {
 	}
 }
 
-// Updated executeFundingStrategy - opens 500ms before funding, places limit order simultaneously
+// Updated executeFundingStrategy - opens 500ms before funding, places stop-loss order simultaneously
 func (tb *TradingBot) executeFundingStrategy(strategy *FundingStrategy) {
 	now := time.Now()
 	fundingTime := strategy.NextFunding
@@ -1185,7 +1267,7 @@ func (tb *TradingBot) executeFundingStrategy(strategy *FundingStrategy) {
 		"💰 Rate: %.6f%%\n"+
 		"⏰ Opening in: %s\n"+
 		"🎯 Funding in: %s\n"+
-		"⚡ Will open 500ms before + limit close order",
+		"🛡️ Will open 500ms before + protective stop-market order",
 		strategy.Symbol, strategy.TargetSide, strategy.UsdtAmount, strategy.Leverage,
 		strategy.FundingRate*100, formatDuration(timeToOpen), formatDuration(timeToFunding)))
 
@@ -1205,28 +1287,33 @@ func (tb *TradingBot) executeFundingStrategy(strategy *FundingStrategy) {
 	qty := positionValue / currentPrice
 	qtyStr := formatQuantity(qty)
 
-	// Calculate limit order price (0.3% below current price)
-	limitPrice := currentPrice * (1 - LIMIT_ORDER_OFFSET)
-	limitPriceStr := formatPrice(limitPrice)
+	// Calculate stop-loss price (0.3% away from current price for protection)
+	var stopLossPrice float64
+	var oppositeSide string
+	var triggerDirection int
 
-	// Determine opposite side for limit order
-	oppositeSide := "Sell"
-	if strategy.TargetSide == "Sell" {
+	if strategy.TargetSide == "Buy" { // Long position
+		oppositeSide = "Sell"
+		// Stop-loss BELOW entry price to protect against downward moves
+		stopLossPrice = currentPrice * (1 - LIMIT_ORDER_OFFSET)
+		triggerDirection = 2 // Trigger when price falls to or below stop price
+	} else { // Short position
 		oppositeSide = "Buy"
-		// For short positions, limit order should be 0.3% above to close
-		limitPrice = currentPrice * (1 + LIMIT_ORDER_OFFSET)
-		limitPriceStr = formatPrice(limitPrice)
+		// Stop-loss ABOVE entry price to protect against upward moves
+		stopLossPrice = currentPrice * (1 + LIMIT_ORDER_OFFSET)
+		triggerDirection = 1 // Trigger when price rises to or above stop price
 	}
+	stopLossPriceStr := formatPrice(stopLossPrice)
 
 	sendMessage(strategy.ChatId, fmt.Sprintf("🎯 OPENING FUNDING POSITION!\n"+
 		"⏰ T-500ms: Opening now...\n"+
 		"💰 Open Price: %.8f\n"+
-		"🎯 Limit Close: %.8f (%.1f%% offset)",
-		currentPrice, limitPrice, LIMIT_ORDER_OFFSET*100))
+		"🛡️ Stop-Loss Trigger: %.8f (%.1f%% protection)",
+		currentPrice, stopLossPrice, LIMIT_ORDER_OFFSET*100))
 
 	// Execute both orders simultaneously
 	orderOpenTime := time.Now()
-	marketOrderId, limitOrderId := tb.executeSimultaneousFundingOrders(strategy, qtyStr, limitPriceStr, oppositeSide)
+	marketOrderId, stopLossOrderId := tb.executeSimultaneousFundingOrdersWithStopLoss(strategy, qtyStr, stopLossPriceStr, oppositeSide, triggerDirection)
 
 	if marketOrderId == "" {
 		sendMessage(strategy.ChatId, "❌ Failed to open funding position")
@@ -1235,20 +1322,20 @@ func (tb *TradingBot) executeFundingStrategy(strategy *FundingStrategy) {
 
 	orderDuration := time.Since(orderOpenTime)
 
-	if limitOrderId != "" {
+	if stopLossOrderId != "" {
 		sendMessage(strategy.ChatId, fmt.Sprintf("✅ FUNDING STRATEGY EXECUTED!\n"+
 			"⚡ Execution Time: %.3f ms\n"+
 			"🆔 Market Order: %s\n"+
-			"🎯 Limit Order: %s\n"+
-			"💰 Open: %.8f\n"+
-			"🎯 Close: %.8f\n"+
+			"🛡️ Stop-Market Order: %s\n"+
+			"💰 Open Price: %.8f\n"+
+			"🛡️ Stop Trigger: %.8f\n"+
 			"⏰ Position opened 500ms before funding",
 			float64(orderDuration.Nanoseconds())/1000000.0,
-			marketOrderId, limitOrderId, currentPrice, limitPrice))
+			marketOrderId, stopLossOrderId, currentPrice, stopLossPrice))
 	} else {
 		sendMessage(strategy.ChatId, fmt.Sprintf("⚠️ PARTIAL SUCCESS!\n"+
 			"✅ Market order filled: %s\n"+
-			"❌ Limit order failed\n"+
+			"❌ Protective stop-market order failed\n"+
 			"⚡ Execution Time: %.3f ms",
 			marketOrderId, float64(orderDuration.Nanoseconds())/1000000.0))
 	}
@@ -1542,6 +1629,7 @@ func (tb *TradingBot) autoCloseTestTrade(chatId int64, symbol, marketOrderId, st
 
 			closeRespChan := make(chan OrderResponse, 1)
 			tb.responses.Store(closeReqId, closeRespChan)
+
 			defer tb.responses.Delete(closeReqId)
 
 			log.Printf("🧪 Auto-close: Attempting to close market position (Order ID: %s) with %s %s (reqId: %s)", marketOrderId, oppositeSide, qty, closeReqId)
