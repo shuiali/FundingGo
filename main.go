@@ -31,7 +31,7 @@ const (
 	ORDER_TIMEOUT       = 3 * time.Second
 
 	// Updated funding constants
-	FUNDING_OPEN_DELAY  = 1100 * time.Millisecond // Exactly 500ms before funding
+	FUNDING_OPEN_DELAY  = 500 * time.Millisecond // Exactly 500ms before funding
 	FUNDING_CLOSE_DELAY = 100 * time.Millisecond // 100ms after funding
 	LIMIT_ORDER_OFFSET  = 0.001                  // 0.3% below/above opening price for limit orders
 
@@ -1230,7 +1230,7 @@ func (tb *TradingBot) executeFundingStrategy(strategy *FundingStrategy) {
 		orderId, currentPrice))
 
 	// Schedule close 1ms after funding is paid
-	closeTime := fundingTime.Add(1 * time.Millisecond)
+	closeTime := fundingTime.Add(10 * time.Millisecond)
 	delay := time.Until(closeTime)
 	if delay < 0 {
 		delay = 0
