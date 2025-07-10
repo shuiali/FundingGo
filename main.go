@@ -31,7 +31,7 @@ const (
 	ORDER_TIMEOUT       = 3 * time.Second
 
 	// Updated funding constants
-	FUNDING_OPEN_DELAY  = 1100 * time.Millisecond // Exactly 500ms before funding
+	FUNDING_OPEN_DELAY  = 500 * time.Millisecond // Exactly 500ms before funding
 	FUNDING_CLOSE_DELAY = 100 * time.Millisecond // 100ms after funding
 	LIMIT_ORDER_OFFSET  = 0.001                  // 0.3% below/above opening price for limit orders
 
@@ -1248,98 +1248,6 @@ func (tb *TradingBot) executeFundingStrategy(strategy *FundingStrategy) {
 	}()
 }
 
-// Remove the stop-market order logic and update ExecuteTestTrade to only open and close after funding
-func (tb *TradingBot) ExecuteTestTrade(req TradeRequest) {
-	sendMessage(req.ChatId, fmt.Sprintf("🧪 TEST TRADE (Market Open, closes 1ms after funding) STARTING!\n"+
-		"📊 %s %s %.2f USDT %.0fx",
-		req.Symbol, req.Side, req.UsdtAmount, req.Leverage))
-
-	if err := tb.checkTradeConnection(); err != nil {
-		sendMessage(req.ChatId, fmt.Sprintf("❌ Test trade connection error: %s", err.Error()))
-		return
-	}
-
-	currentPrice, err := tb.GetPrice(req.Symbol)
-	if err != nil || currentPrice == 0 {
-		sendMessage(req.ChatId, fmt.Sprintf("❌ Test trade: Cannot get current price for %s", req.Symbol))
-		return
-	}
-
-	positionValue := req.UsdtAmount * req.Leverage
-	qty := positionValue / currentPrice
-	qtyStr := formatQuantity(qty)
-
-	parsedQty, parseErr := strconv.ParseFloat(qtyStr, 64)
-	if parseErr != nil || parsedQty <= 0 {
-		sendMessage(req.ChatId, fmt.Sprintf("❌ Test trade: Invalid quantity format: %s", qtyStr))
-		return
-	}
-	if positionValue < 5.0 {
-		sendMessage(req.ChatId, fmt.Sprintf("❌ Test trade: Minimum order value is 5 USDT (yours: %.2f USDT)", positionValue))
-		return
-	}
-
-	orderOpenTime := time.Now()
-	reqId := generateReqId()
-	orderMsg := buildOrderMessage(reqId, req.Symbol, req.Side, qtyStr)
-	respChan := make(chan OrderResponse, 1)
-	tb.responses.Store(reqId, respChan)
-	defer tb.responses.Delete(reqId)
-
-	tb.tradeWriteMutex.Lock()
-	err = tb.tradeConn.WriteMessage(websocket.TextMessage, orderMsg)
-	tb.tradeWriteMutex.Unlock()
-	if err != nil {
-		sendMessage(req.ChatId, fmt.Sprintf("❌ Failed to send order: %v", err))
-		return
-	}
-
-	var orderId string
-	select {
-	case resp := <-respChan:
-		if resp.RetCode != 0 {
-			sendMessage(req.ChatId, fmt.Sprintf("❌ Order failed: %s", resp.RetMsg))
-			return
-		}
-		orderId = resp.Data.OrderId
-	case <-time.After(ORDER_TIMEOUT):
-		sendMessage(req.ChatId, "❌ Order timeout")
-		return
-	}
-
-	orderDuration := time.Since(orderOpenTime)
-	sendMessage(req.ChatId, fmt.Sprintf("✅ TEST TRADE OPENED!\n"+
-		"⚡ Execution Time: %.3f ms\n"+
-		"🆔 Order: %s\n"+
-		"💰 Open: %.8f\n"+
-		"⏰ Will close 1ms after funding is paid.",
-		float64(orderDuration.Nanoseconds())/1000000.0,
-		orderId, currentPrice))
-
-	// For test, close 1ms after funding (simulate funding time as now + 2s for demo if not available)
-	fundingTime := time.Now().Add(2 * time.Second) // Replace with actual funding time if available
-	if fundingInfo, exists := tb.fundingCache.Load(req.Symbol); exists {
-		info := fundingInfo.(FundingInfo)
-		fundingTime = time.Unix(info.FundingTimestamp, 0)
-	}
-	closeTime := fundingTime.Add(1 * time.Millisecond)
-	delay := time.Until(closeTime)
-	if delay < 0 {
-		delay = 0
-	}
-	go func() {
-		time.Sleep(delay)
-		tb.immediateClose(req.ChatId, req.Symbol, orderId,
-			func() string {
-				if req.Side == "Buy" {
-					return "Sell"
-				} else {
-					return "Buy"
-				}
-			}(), qtyStr, time.Now(), orderOpenTime)
-	}()
-}
-
 // Telegram message handler
 func sendMessage(chatId int64, text string) {
 	msg := tgbotapi.NewMessage(chatId, text)
@@ -1370,7 +1278,6 @@ func handleUpdates(tb *TradingBot) {
 					"/trade <SYMBOL> <BUY/SELL> <USDT> <LEVERAGE> - Execute trade\n" +
 					"/funding <SYMBOL> - Show funding info\n" +
 					"/strategy <SYMBOL> <USDT> <LEVERAGE> - Set funding strategy (auto-tests)\n" +
-					"/test <SYMBOL> <USDT> <LEVERAGE> - Manual test trade\n" +
 					"/strategies - List active strategies\n" +
 					"/fundings - List all funding rates\n" +
 					"/status - Connection status\n" +
@@ -1799,19 +1706,6 @@ func (tb *TradingBot) setupFundingStrategy(chatId int64, symbol string, usdtAmou
 		symbol, targetSide, usdtAmount, leverage,
 		info.FundingRate*100, formatDuration(timeLeft))
 	sendMessage(chatId, msg)
-
-	// First run a test trade with the same parameters
-	sendMessage(chatId, "🧪 Running test trade (market open + protective stop-market close) before scheduling funding trade...")
-	sendMessage(chatId, "⏰ Test orders will auto-close after exactly 5 seconds...") // Inform user about auto-closure
-	testReq := TradeRequest{
-		Symbol:     symbol,
-		Side:       targetSide, // Use the same side as the funding strategy
-		UsdtAmount: usdtAmount,
-		Leverage:   leverage,
-		ChatId:     chatId,
-	}
-	// Execute test trade synchronously (it places orders and returns, auto-close is a goroutine)
-	tb.ExecuteTestTrade(testReq)
 
 	// Wait a bit after test trade orders are placed and initial messages sent.
 	// The auto-close will happen in parallel.
